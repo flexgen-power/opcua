@@ -10,6 +10,7 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"log"
 	"math"
@@ -242,6 +243,19 @@ func newSecureChannel(endpoint string, c *uacp.Conn, cfg *Config, kind channelKi
 
 func (s *SecureChannel) RemoteAddr() net.Addr {
 	return s.c.TCPConn.RemoteAddr()
+}
+
+func (s *SecureChannel) ID() uint32 {
+	s.instancesMu.Lock()
+	defer s.instancesMu.Unlock()
+
+	if s.activeInstance != nil {
+		return s.activeInstance.secureChannelID
+	}
+	if s.openingInstance != nil {
+		return s.openingInstance.secureChannelID
+	}
+	return 0
 }
 
 func (s *SecureChannel) getActiveChannelInstance() (*channelInstance, error) {
@@ -1110,6 +1124,7 @@ func (s *SecureChannel) sendResponseWithContext(ctx context.Context, instance *c
 	if typeID == 0 {
 		return errors.Errorf("uasc: unknown service %T. Did you call register?", resp)
 	}
+	serviceType := fmt.Sprintf("%T", resp)
 
 	var err error
 	if instance == nil {
@@ -1135,24 +1150,91 @@ func (s *SecureChannel) sendResponseWithContext(ctx context.Context, instance *c
 	if err != nil {
 		return err
 	}
+	emitDiagInfo(s.cfg.Logger, diagPayload{
+		Event:           "response_send_start",
+		ServiceType:     serviceType,
+		RequestID:       reqID,
+		SecureChannelID: instance.secureChannelID,
+		PayloadBytes:    len(b),
+	})
 
 	// send the message
-	n, err := s.c.Write(b)
+	n, timedOut, err := s.writeResponse(ctx, b)
 	if err != nil {
+		event := "response_send_failure"
+		if timedOut {
+			event = "response_send_timeout"
+		}
+		emitDiagWarn(s.cfg.Logger, diagPayload{
+			Event:           event,
+			ServiceType:     serviceType,
+			RequestID:       reqID,
+			SecureChannelID: instance.secureChannelID,
+			PayloadBytes:    len(b),
+			ErrorText:       err.Error(),
+		})
 		return err
-	}
-
-	// todo(fs): what if len(b) != n? Can this happen?
-	if len(b) != n {
-		return errors.Errorf("uasc: incomplete message %T sent len=%d sent=%d", resp, len(b), n)
 	}
 
 	atomic.AddUint64(&instance.bytesSent, uint64(n))
 	atomic.AddUint32(&instance.messagesSent, 1)
+	emitDiagInfo(s.cfg.Logger, diagPayload{
+		Event:           "response_send_end",
+		ServiceType:     serviceType,
+		RequestID:       reqID,
+		SecureChannelID: instance.secureChannelID,
+		PayloadBytes:    n,
+	})
 
 	debug.Printf("uasc %d/%d: send %T with %d bytes", s.c.ID(), reqID, resp, len(b))
 
 	return nil
+}
+
+func (s *SecureChannel) writeResponse(ctx context.Context, payload []byte) (int, bool, error) {
+	select {
+	case <-ctx.Done():
+		return 0, false, ctx.Err()
+	default:
+	}
+
+	deadline, hasDeadline := responseWriteDeadline(ctx, s.cfg.ResponseWriteTimeout, time.Now())
+	if hasDeadline {
+		if err := s.c.SetWriteDeadline(deadline); err != nil {
+			_ = s.c.Close()
+			return 0, false, err
+		}
+	}
+
+	n, err := s.c.Write(payload)
+	if err != nil {
+		_ = s.c.Close()
+		var netErr net.Error
+		return n, errors.As(err, &netErr) && netErr.Timeout(), err
+	}
+	if n != len(payload) {
+		err = errors.Errorf("uasc: incomplete response sent len=%d sent=%d", len(payload), n)
+		_ = s.c.Close()
+		return n, false, err
+	}
+	if hasDeadline {
+		if err := s.c.SetWriteDeadline(time.Time{}); err != nil {
+			_ = s.c.Close()
+			return n, false, err
+		}
+	}
+	return n, false, nil
+}
+
+func responseWriteDeadline(ctx context.Context, timeout time.Duration, now time.Time) (time.Time, bool) {
+	var deadline time.Time
+	if timeout > 0 {
+		deadline = now.Add(timeout)
+	}
+	if contextDeadline, ok := ctx.Deadline(); ok && (deadline.IsZero() || contextDeadline.Before(deadline)) {
+		deadline = contextDeadline
+	}
+	return deadline, !deadline.IsZero()
 }
 
 func (s *SecureChannel) nextRequestID() uint32 {

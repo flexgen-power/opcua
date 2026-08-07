@@ -127,7 +127,7 @@ func getSubRefs(srv *Server, nid *ua.NodeID) []*ua.NodeID {
 	if node == nil {
 		return nil
 	}
-	for _, ref := range node.refs {
+	for _, ref := range node.referenceSnapshot() {
 		if ref.ReferenceTypeID.Equal(hasSubtype) && ref.IsForward && ref.NodeID != nil {
 			refs = append(refs, ref.NodeID.NodeID)
 			refs = append(refs, getSubRefs(srv, ref.NodeID.NodeID)...)

@@ -63,6 +63,10 @@ func (sb *sessionBroker) Close(authToken *ua.NodeID) error {
 		if sb.logger != nil {
 			sb.logger.Warn("sessionBroker.Close: error looking up session %v", authToken)
 		}
+		emitDiagWarn(sb.logger, diagPayload{
+			Event:     "session_lookup_missing",
+			ErrorText: authToken.String(),
+		})
 	}
 	delete(sb.s, authToken.String())
 
@@ -78,6 +82,10 @@ func (sb *sessionBroker) Session(authToken *ua.NodeID) *session {
 		if sb.logger != nil {
 			sb.logger.Warn("sessionBroker.Session: error looking up session %v", authToken)
 		}
+		emitDiagWarn(sb.logger, diagPayload{
+			Event:     "session_lookup_invalid",
+			ErrorText: authToken.String(),
+		})
 	}
 
 	return s

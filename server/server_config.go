@@ -125,6 +125,14 @@ func defaultChannelConfig() *uasc.Config {
 	}
 }
 
+// ResponseWriteTimeout bounds server response writes. A non-positive value
+// disables the library timeout, while a context deadline still takes precedence.
+func ResponseWriteTimeout(timeout time.Duration) Option {
+	return func(s *serverConfig) {
+		s.responseWriteTimeout = timeout
+	}
+}
+
 func ServerName(name string) Option {
 	return func(s *serverConfig) {
 		s.applicationName = name

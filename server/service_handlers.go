@@ -6,6 +6,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/gopcua/opcua/id"
@@ -104,6 +105,18 @@ func (s *Server) handleService(ctx context.Context, sc *uasc.SecureChannel, reqI
 	if s.cfg.logger != nil {
 		s.cfg.logger.Debug("handleService: Got: %T\n", req)
 	}
+	startedAt := time.Now()
+	serviceType := "unknown"
+	if req != nil {
+		serviceType = fmt.Sprintf("%T", req)
+	}
+	emitDiagInfo(s.cfg.logger, diagPayload{
+		Event:           "service_dispatch_start",
+		ServiceType:     serviceType,
+		RequestID:       reqID,
+		SecureChannelID: secureChannelID(sc),
+		RemoteAddr:      remoteAddr(sc),
+	})
 
 	var resp ua.Response
 	var err error
@@ -119,6 +132,32 @@ func (s *Server) handleService(ctx context.Context, sc *uasc.SecureChannel, reqI
 			}
 		}
 		err = ua.StatusBadServiceUnsupported
+	}
+	durationMs := time.Since(startedAt).Milliseconds()
+	endPayload := diagPayload{
+		Event:           "service_dispatch_end",
+		ServiceType:     serviceType,
+		RequestID:       reqID,
+		SecureChannelID: secureChannelID(sc),
+		RemoteAddr:      remoteAddr(sc),
+		DurationMs:      &durationMs,
+	}
+	if err != nil {
+		endPayload.Event = "service_dispatch_error"
+		endPayload.ErrorText = err.Error()
+		emitDiagWarn(s.cfg.logger, endPayload)
+	} else {
+		emitDiagInfo(s.cfg.logger, endPayload)
+	}
+	if durationMs > 1000 {
+		emitDiagWarn(s.cfg.logger, diagPayload{
+			Event:           "service_dispatch_slow",
+			ServiceType:     serviceType,
+			RequestID:       reqID,
+			SecureChannelID: secureChannelID(sc),
+			RemoteAddr:      remoteAddr(sc),
+			DurationMs:      &durationMs,
+		})
 	}
 
 	if err != nil {

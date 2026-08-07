@@ -194,9 +194,6 @@ func (as *NodeNameSpace) Root() *Node {
 }
 
 func (ns *NodeNameSpace) Browse(bd *ua.BrowseDescription) *ua.BrowseResult {
-	ns.mu.RLock()
-	defer ns.mu.RUnlock()
-
 	if ns.srv.cfg.logger != nil {
 		ns.srv.cfg.logger.Debug("BrowseRequest: id=%s mask=%08b\n", bd.NodeID, bd.ResultMask)
 	}
@@ -206,10 +203,10 @@ func (ns *NodeNameSpace) Browse(bd *ua.BrowseDescription) *ua.BrowseResult {
 		return &ua.BrowseResult{StatusCode: ua.StatusBadNodeIDUnknown}
 	}
 
-	refs := make([]*ua.ReferenceDescription, 0, len(n.refs))
+	nodeRefs := n.referenceSnapshot()
+	refs := make([]*ua.ReferenceDescription, 0, len(nodeRefs))
 
-	for i := range n.refs {
-		r := n.refs[i]
+	for _, r := range nodeRefs {
 		// we can't have nils in these or the encoder will fail.
 		if r.NodeID == nil || r.BrowseName == nil || r.DisplayName == nil || r.TypeDefinition == nil {
 			continue

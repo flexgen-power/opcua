@@ -4,6 +4,7 @@ import (
 	"log"
 	"maps"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/gopcua/opcua/id"
@@ -65,16 +66,17 @@ func DataValueFromValue(val any) *ua.DataValue {
 }
 
 type Node struct {
-	id   *ua.NodeID
-	attr Attributes
-	refs References
-	val  ValueFunc
+	id     *ua.NodeID
+	attr   Attributes
+	refsMu sync.RWMutex
+	refs   References
+	val    ValueFunc
 
 	ns NameSpace
 }
 
 func NewNode(id *ua.NodeID, attr Attributes, refs References, val ValueFunc) *Node {
-	n := &Node{id, attr, refs, val, nil}
+	n := &Node{id: id, attr: attr, refs: refs, val: val}
 	n.sanitize()
 	return n
 }
@@ -266,8 +268,7 @@ func (n *Node) DataType() *ua.ExpandedNodeID {
 	v := n.attr[ua.AttributeIDDataType]
 	if v == nil || v.Value.Value() == nil {
 		// if we have a type definition, return that?
-		for i := range n.refs {
-			r := n.refs[i]
+		for _, r := range n.referenceSnapshot() {
 			if r.ReferenceTypeID == nil {
 				log.Printf("reftypeid was nil!")
 			}
@@ -305,13 +306,13 @@ func (n *Node) AddObject(o *Node) *Node {
 	nn := &Node{
 		id:   o.id,
 		attr: maps.Clone(o.attr),
-		refs: slices.Clone(o.refs),
+		refs: o.referenceSnapshot(),
 	}
 	if n.attr == nil {
 		n.attr = Attributes{}
 	}
 	nn.SetNodeClass(ua.NodeClassObject)
-	n.refs = append(n.refs, refs.Organizes(nn.id, nn.BrowseName().Name, nn.DisplayName().Text, nn.DataType()))
+	n.appendReference(refs.Organizes(nn.id, nn.BrowseName().Name, nn.DisplayName().Text, nn.DataType()))
 	return n.ns.AddNode(nn)
 }
 
@@ -319,14 +320,14 @@ func (n *Node) AddVariable(o *Node) *Node {
 	nn := &Node{
 		id:   o.id,
 		attr: maps.Clone(o.attr),
-		refs: slices.Clone(o.refs),
+		refs: o.referenceSnapshot(),
 		val:  o.val,
 	}
 	if n.attr == nil {
 		n.attr = Attributes{}
 	}
 	nn.SetNodeClass(ua.NodeClassVariable)
-	n.refs = append(n.refs, refs.Organizes(nn.id, nn.BrowseName().Name, nn.DisplayName().Text, nn.DataType()))
+	n.appendReference(refs.Organizes(nn.id, nn.BrowseName().Name, nn.DisplayName().Text, nn.DataType()))
 	return nn
 }
 
@@ -350,7 +351,22 @@ func (n *Node) AddRef(o *Node, rt RefType, forward bool) {
 		NodeClass:       o.NodeClass(),
 		TypeDefinition:  o.DataType(),
 	}
-	n.refs = append(n.refs, &ref)
+	n.appendReference(&ref)
+}
+
+func (n *Node) appendReference(ref *ua.ReferenceDescription) {
+	n.refsMu.Lock()
+	n.refs = append(n.refs, ref)
+	n.refsMu.Unlock()
+}
+
+func (n *Node) referenceSnapshot() References {
+	if n == nil {
+		return nil
+	}
+	n.refsMu.RLock()
+	defer n.refsMu.RUnlock()
+	return slices.Clone(n.refs)
 }
 
 // Access returns true if the node has the access level requested.
@@ -360,7 +376,7 @@ func (n *Node) AddRef(o *Node, rt RefType, forward bool) {
 // I'm not sure what the best way to implement "user" specific access levels
 // is presently.  Will need functioning user authentication first, and then a way to
 // pass it into the nodes user access attribute so it can be checked properly.
-func (n Node) Access(flag ua.AccessLevelType) bool {
+func (n *Node) Access(flag ua.AccessLevelType) bool {
 
 	access, err := n.Attribute(ua.AttributeIDUserAccessLevel)
 	if err == nil { // if we have a user access level, we need to check it.
