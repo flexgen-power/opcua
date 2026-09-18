@@ -97,41 +97,108 @@ func (s *MonitoredItemService) DeleteSub(id uint32) {
 	}
 }
 
+// namespaceLookup caches one Server.Namespace result for the length of a single
+// ChangeNotifications call.
+type namespaceLookup struct {
+	ns  NameSpace
+	err error
+}
+
+// pendingNotification is one monitored item that needs telling about a node
+// change. It is captured under MonitoredItemService.Mu so that the notification
+// itself can be built and delivered after the lock has been released.
+type pendingNotification struct {
+	sub          *Subscription
+	clientHandle uint32
+	node         *ua.NodeID
+	attributeID  ua.AttributeID
+	ns           namespaceLookup
+}
+
+// ChangeNotification tells every monitored item watching n that its value changed.
 func (s *MonitoredItemService) ChangeNotification(n *ua.NodeID) {
+	s.ChangeNotifications([]*ua.NodeID{n})
+}
 
-	s.Mu.Lock()
-	defer s.Mu.Unlock()
-	items, ok := s.Nodes[n.String()]
-
-	if !ok {
-		// this node isn't monitored - don't have to do anything.
-		return
-	}
-
-	ns, err := s.SubService.srv.Namespace(int(n.Namespace()))
-
-	for i := range items {
-		item := items[i]
-		if item == nil {
+// ChangeNotifications is the batch form of ChangeNotification. A caller that
+// changes many nodes at once -- one decoded message fanning out to one node per
+// field, say -- pays a single Mu acquisition for the whole set instead of one per
+// node.
+//
+// Notifications are collected under Mu and delivered after it is released. Sending
+// while holding the lock is what let a single subscriber that had stopped draining
+// its 100-deep NotifyChannel wedge Mu permanently, and with it every later
+// CreateMonitoredItems / DeleteMonitoredItems / DeleteSubscriptions handler, since
+// a subscription's run() goroutine calls DeleteSubscription on its way out and that
+// needs the same mutex. The send below still blocks, so an undrained subscription
+// can still stall the goroutine that is notifying it -- it can no longer stall the
+// service.
+func (s *MonitoredItemService) ChangeNotifications(nodes []*ua.NodeID) {
+	// Server.Namespace takes the server mutex, so resolve namespaces up front
+	// rather than nesting that lock under Mu. Every node in a batch usually shares
+	// one namespace, hence the cache.
+	lookups := make(map[uint16]namespaceLookup, 1)
+	for _, n := range nodes {
+		if n == nil {
 			continue
 		}
+		if _, ok := lookups[n.Namespace()]; ok {
+			continue
+		}
+		ns, err := s.SubService.srv.Namespace(int(n.Namespace()))
+		lookups[n.Namespace()] = namespaceLookup{ns: ns, err: err}
+	}
+
+	for _, p := range s.collectNotifications(nodes, lookups) {
 		val := new(ua.MonitoredItemNotification)
-		val.ClientHandle = item.Req.RequestedParameters.ClientHandle
-		if err != nil {
+		val.ClientHandle = p.clientHandle
+		if p.ns.err != nil {
 			if s.SubService.srv.cfg.logger != nil {
-				s.SubService.srv.cfg.logger.Warn("error getting namespace %d: %v", n.Namespace(), err)
+				s.SubService.srv.cfg.logger.Warn("error getting namespace %d: %v", p.node.Namespace(), p.ns.err)
 			}
 			val.Value = &ua.DataValue{}
 			val.Value.Status = ua.StatusBad
 			val.Value.EncodingMask |= ua.DataValueStatusCode
-			item.Sub.NotifyChannel <- val
+			p.sub.NotifyChannel <- val
 			continue
 		}
-		dv := ns.Attribute(n, item.Req.ItemToMonitor.AttributeID)
-		val.Value = dv
-		item.Sub.NotifyChannel <- val
+		val.Value = p.ns.ns.Attribute(p.node, p.attributeID)
+		p.sub.NotifyChannel <- val
 	}
+}
 
+// collectNotifications is the locked half of ChangeNotifications: it walks the
+// monitored-item bookkeeping for every changed node and returns the deliveries
+// that implies. Nothing in here may block -- no channel sends, no other locks.
+func (s *MonitoredItemService) collectNotifications(nodes []*ua.NodeID, lookups map[uint16]namespaceLookup) []pendingNotification {
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
+
+	var pending []pendingNotification
+	for _, n := range nodes {
+		if n == nil {
+			continue
+		}
+		items, ok := s.Nodes[n.String()]
+		if !ok {
+			// this node isn't monitored - don't have to do anything.
+			continue
+		}
+		for i := range items {
+			item := items[i]
+			if item == nil {
+				continue
+			}
+			pending = append(pending, pendingNotification{
+				sub:          item.Sub,
+				clientHandle: item.Req.RequestedParameters.ClientHandle,
+				node:         n,
+				attributeID:  item.Req.ItemToMonitor.AttributeID,
+				ns:           lookups[n.Namespace()],
+			})
+		}
+	}
+	return pending
 }
 
 func (s *MonitoredItemService) NextID() uint32 {
