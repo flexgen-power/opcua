@@ -71,6 +71,12 @@ func (s *NodeNameSpace) ChangeNotification(nodeid *ua.NodeID) {
 	s.srv.ChangeNotification(nodeid)
 }
 
+// This is the batch form of ChangeNotification, for notifying about a set of
+// changed nodes in one pass over the monitored-item bookkeeping
+func (s *NodeNameSpace) ChangeNotifications(nodeids []*ua.NodeID) {
+	s.srv.ChangeNotifications(nodeids)
+}
+
 func (ns *NodeNameSpace) Name() string {
 	return ns.name
 }
