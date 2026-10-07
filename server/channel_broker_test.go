@@ -218,3 +218,91 @@ func TestRegisterConnExitsOnContextDoneWhileDispatching(t *testing.T) {
 		t.Fatal("channel_closed diagnostic does not report close_cause context_done")
 	}
 }
+
+// Readers queue behind each other on the unbuffered hand-off, so a dispatcher
+// that keeps accepting messages must not cause any reader to time out even
+// when the backlog takes longer than the bound to drain.
+func TestRegisterConnKeepsChannelsWhileDispatcherDrainsBacklog(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const (
+		conns   = 8
+		bound   = 400 * time.Millisecond
+		perItem = 100 * time.Millisecond
+	)
+	logger := &recordingLogger{}
+	cb := newChannelBroker(logger, time.Second, bound)
+
+	consumed := make(chan struct{}, conns)
+	go func() {
+		for {
+			if cb.ReadMessage(ctx) == nil {
+				return
+			}
+			time.Sleep(perItem)
+			consumed <- struct{}{}
+		}
+	}()
+
+	bcs := make([]*brokerConn, conns)
+	for i := range bcs {
+		bcs[i] = registerLoopbackConn(t, ctx, cb)
+	}
+
+	for i := 0; i < conns; i++ {
+		select {
+		case <-consumed:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("dispatcher consumed only %d of %d queued messages", i, conns)
+		}
+	}
+
+	for i, bc := range bcs {
+		select {
+		case <-bc.done:
+			t.Fatalf("connection %d was closed although the dispatcher kept making progress", i)
+		default:
+		}
+	}
+	if n := channelCount(cb); n != conns {
+		t.Fatalf("channel map has %d entries, want %d", n, conns)
+	}
+	if logger.contains(`"event":"channel_dispatch_timeout"`) {
+		t.Fatal("channel_dispatch_timeout logged although the dispatcher kept making progress")
+	}
+}
+
+func TestRegisterConnClosesChannelWhenDispatcherStallsAfterProgress(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	logger := &recordingLogger{}
+	cb := newChannelBroker(logger, time.Second, 200*time.Millisecond)
+	first := registerLoopbackConn(t, ctx, cb)
+
+	readCtx, readCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer readCancel()
+	if msg := cb.ReadMessage(readCtx); msg == nil {
+		t.Fatal("dispatcher did not receive the first connection's message")
+	}
+
+	stuck := registerLoopbackConn(t, ctx, cb)
+	select {
+	case <-stuck.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("RegisterConn still blocked after the dispatcher stopped accepting messages")
+	}
+	if !logger.contains(`"close_cause":"dispatch_timeout"`) {
+		t.Fatal("channel_closed diagnostic does not report close_cause dispatch_timeout")
+	}
+
+	select {
+	case <-first.done:
+		t.Fatal("connection whose message was accepted was closed")
+	default:
+	}
+	if n := channelCount(cb); n != 1 {
+		t.Fatalf("channel map has %d entries, want 1", n)
+	}
+}
