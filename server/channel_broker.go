@@ -7,6 +7,7 @@ import (
 	"io"
 	mrand "math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gopcua/opcua/ua"
@@ -36,8 +37,14 @@ type channelBroker struct {
 	logger               Logger
 	responseWriteTimeout time.Duration
 
-	// dispatchTimeout bounds each hand-off to msgChan; non-positive disables it.
+	// dispatchTimeout is how long a reader waits to hand off a message while
+	// the dispatcher accepts nothing at all; non-positive disables it.
 	dispatchTimeout time.Duration
+
+	// epoch and lastAccept (nanoseconds since epoch) keep the dispatcher's
+	// progress on the monotonic clock.
+	epoch      time.Time
+	lastAccept atomic.Int64
 }
 
 func newChannelBroker(logger Logger, responseWriteTimeout, dispatchTimeout time.Duration) *channelBroker {
@@ -51,27 +58,50 @@ func newChannelBroker(logger Logger, responseWriteTimeout, dispatchTimeout time.
 		logger:               logger,
 		responseWriteTimeout: responseWriteTimeout,
 		dispatchTimeout:      dispatchTimeout,
+		epoch:                time.Now(),
 	}
 }
 
 // dispatch hands msg to the server's request dispatcher. It reports
 // "context_done" or "dispatch_timeout" when the hand-off was abandoned, and ""
 // once the dispatcher has taken the message.
+//
+// Blocked readers queue behind each other on msgChan, so the bound measures how
+// long the dispatcher has gone without accepting any message rather than how
+// long this reader has waited; a busy dispatcher draining a backlog must not
+// drop connections.
 func (c *channelBroker) dispatch(ctx context.Context, msg *uasc.MessageBody) string {
-	var timeout <-chan time.Time
-	if c.dispatchTimeout > 0 {
-		t := time.NewTimer(c.dispatchTimeout)
-		defer t.Stop()
-		timeout = t.C
+	if c.dispatchTimeout <= 0 {
+		select {
+		case c.msgChan <- msg:
+			return ""
+		case <-ctx.Done():
+			return "context_done"
+		}
 	}
-	select {
-	case c.msgChan <- msg:
-		return ""
-	case <-ctx.Done():
-		return "context_done"
-	case <-timeout:
-		return "dispatch_timeout"
+
+	start := c.sinceEpoch()
+	t := time.NewTimer(c.dispatchTimeout)
+	defer t.Stop()
+	for {
+		select {
+		case c.msgChan <- msg:
+			return ""
+		case <-ctx.Done():
+			return "context_done"
+		case <-t.C:
+			progress := max(start, time.Duration(c.lastAccept.Load()))
+			idle := c.sinceEpoch() - progress
+			if idle >= c.dispatchTimeout {
+				return "dispatch_timeout"
+			}
+			t.Reset(c.dispatchTimeout - idle)
+		}
 	}
+}
+
+func (c *channelBroker) sinceEpoch() time.Duration {
+	return time.Since(c.epoch)
 }
 
 // RegisterConn connects a new UACP connection to the channel broker's list
@@ -148,7 +178,7 @@ outer:
 			if cause := c.dispatch(ctx, msg); cause != "" {
 				closeCause = cause
 				if cause == "dispatch_timeout" {
-					closeErr = fmt.Sprintf("request dispatcher did not accept a message within %s", c.dispatchTimeout)
+					closeErr = fmt.Sprintf("request dispatcher accepted no messages for %s", c.dispatchTimeout)
 					emitDiagWarn(c.logger, diagPayload{
 						Event:           "channel_dispatch_timeout",
 						SecureChannelID: secureChannelID,
@@ -224,6 +254,7 @@ func (c *channelBroker) ReadMessage(ctx context.Context) *uasc.MessageBody {
 	case <-ctx.Done():
 		return nil
 	case msg := <-c.msgChan:
+		c.lastAccept.Store(int64(c.sinceEpoch()))
 		return msg
 	}
 }
