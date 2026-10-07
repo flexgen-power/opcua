@@ -26,6 +26,25 @@ type MonitoredItemService struct {
 	Subs map[uint32][]*MonitoredItem
 
 	id uint32
+
+	// nodeLocks serializes delivery (the attribute read plus the channel send)
+	// per node now that neither happens under Mu. Without this, two overlapping
+	// ChangeNotifications calls for the same node can have their reads and sends
+	// interleave, so a goroutine that read an older value can send after one that
+	// read a newer value, leaving the stale value as "latest" in a subscriber's
+	// publish queue. Never acquire Mu while holding one of these -- lock ordering
+	// here is always nodeLocks entry, then (separately, inside collectNotifications)
+	// Mu, never the reverse.
+	nodeLocks sync.Map // map[string]*sync.Mutex
+}
+
+// nodeLock returns the mutex serializing delivery for the given node key,
+// creating it on first use. Entries are never removed; the key space is the
+// set of distinct monitored node IDs, which is bounded by the address space,
+// not by how many change events occur.
+func (s *MonitoredItemService) nodeLock(key string) *sync.Mutex {
+	v, _ := s.nodeLocks.LoadOrStore(key, &sync.Mutex{})
+	return v.(*sync.Mutex)
 }
 
 // function to get rid of all references to a specific Monitored Item (by ID number)
@@ -130,9 +149,11 @@ func (s *MonitoredItemService) ChangeNotification(n *ua.NodeID) {
 // its 100-deep NotifyChannel wedge Mu permanently, and with it every later
 // CreateMonitoredItems / DeleteMonitoredItems / DeleteSubscriptions handler, since
 // a subscription's run() goroutine calls DeleteSubscription on its way out and that
-// needs the same mutex. The send below still blocks, so an undrained subscription
-// can still stall the goroutine that is notifying it -- it can no longer stall the
-// service.
+// needs the same mutex.
+//
+// Delivery itself (see deliver) no longer blocks forever on a subscription that
+// has already shut down, and is serialized per node so a slow or reordered
+// goroutine can't deliver a stale value after a fresher one already landed.
 func (s *MonitoredItemService) ChangeNotifications(nodes []*ua.NodeID) {
 	// Server.Namespace takes the server mutex, so resolve namespaces up front
 	// rather than nesting that lock under Mu. Every node in a batch usually shares
@@ -150,20 +171,52 @@ func (s *MonitoredItemService) ChangeNotifications(nodes []*ua.NodeID) {
 	}
 
 	for _, p := range s.collectNotifications(nodes, lookups) {
-		val := new(ua.MonitoredItemNotification)
-		val.ClientHandle = p.clientHandle
-		if p.ns.err != nil {
-			if s.SubService.srv.cfg.logger != nil {
-				s.SubService.srv.cfg.logger.Warn("error getting namespace %d: %v", p.node.Namespace(), p.ns.err)
-			}
-			val.Value = &ua.DataValue{}
-			val.Value.Status = ua.StatusBad
-			val.Value.EncodingMask |= ua.DataValueStatusCode
-			p.sub.NotifyChannel <- val
-			continue
+		s.deliver(p)
+	}
+}
+
+// deliver builds and sends one notification for a pending delivery. It is
+// never called while MonitoredItemService.Mu is held.
+//
+// Two hazards exist once delivery happens outside Mu, both now handled here:
+//
+//  1. The subscription's run() goroutine may have already exited (client
+//     disconnect, subscription timeout) leaving NotifyChannel permanently
+//     undrained. An unconditional send on a full channel would block this
+//     goroutine forever. Selecting on the subscription's shutdown channel
+//     (closed exactly once, under SubscriptionService.DeleteSubscription)
+//     bounds that wait: once shutdown is closed the send case and the
+//     shutdown case race, and either one proceeding ends the call.
+//  2. Two ChangeNotifications calls for the same node can now overlap. Before
+//     this change, the attribute read and the send both happened under Mu, so
+//     they were implicitly serialized per node. Without that, caller A can
+//     read an older value, caller B can read a newer value and send it first,
+//     and caller A's send can then land after B's -- leaving the older value
+//     as "latest" in the subscriber's publish queue. Holding the per-node lock
+//     across the read and the send restores that ordering: whichever delivery
+//     for a given node runs last always re-reads the live (current) value, so
+//     a stale value can never overwrite a fresher one.
+func (s *MonitoredItemService) deliver(p pendingNotification) {
+	lock := s.nodeLock(p.node.String())
+	lock.Lock()
+	defer lock.Unlock()
+
+	val := new(ua.MonitoredItemNotification)
+	val.ClientHandle = p.clientHandle
+	if p.ns.err != nil {
+		if s.SubService.srv.cfg.logger != nil {
+			s.SubService.srv.cfg.logger.Warn("error getting namespace %d: %v", p.node.Namespace(), p.ns.err)
 		}
+		val.Value = &ua.DataValue{}
+		val.Value.Status = ua.StatusBad
+		val.Value.EncodingMask |= ua.DataValueStatusCode
+	} else {
 		val.Value = p.ns.ns.Attribute(p.node, p.attributeID)
-		p.sub.NotifyChannel <- val
+	}
+
+	select {
+	case p.sub.NotifyChannel <- val:
+	case <-p.sub.shutdown:
 	}
 }
 
