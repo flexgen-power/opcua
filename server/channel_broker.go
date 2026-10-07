@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"crypto/rsa"
+	"fmt"
 	"io"
 	mrand "math/rand"
 	"sync"
@@ -34,9 +35,12 @@ type channelBroker struct {
 	msgChan              chan *uasc.MessageBody
 	logger               Logger
 	responseWriteTimeout time.Duration
+
+	// dispatchTimeout bounds each hand-off to msgChan; non-positive disables it.
+	dispatchTimeout time.Duration
 }
 
-func newChannelBroker(logger Logger, responseWriteTimeout time.Duration) *channelBroker {
+func newChannelBroker(logger Logger, responseWriteTimeout, dispatchTimeout time.Duration) *channelBroker {
 	rng := mrand.New(mrand.NewSource(time.Now().UnixNano()))
 	return &channelBroker{
 		endpoints:            make(map[string]*ua.EndpointDescription),
@@ -46,6 +50,27 @@ func newChannelBroker(logger Logger, responseWriteTimeout time.Duration) *channe
 		secureTokenID:        uint32(rng.Int31()),
 		logger:               logger,
 		responseWriteTimeout: responseWriteTimeout,
+		dispatchTimeout:      dispatchTimeout,
+	}
+}
+
+// dispatch hands msg to the server's request dispatcher. It reports
+// "context_done" or "dispatch_timeout" when the hand-off was abandoned, and ""
+// once the dispatcher has taken the message.
+func (c *channelBroker) dispatch(ctx context.Context, msg *uasc.MessageBody) string {
+	var timeout <-chan time.Time
+	if c.dispatchTimeout > 0 {
+		t := time.NewTimer(c.dispatchTimeout)
+		defer t.Stop()
+		timeout = t.C
+	}
+	select {
+	case c.msgChan <- msg:
+		return ""
+	case <-ctx.Done():
+		return "context_done"
+	case <-timeout:
+		return "dispatch_timeout"
 	}
 }
 
@@ -120,8 +145,24 @@ outer:
 				closeErr = msg.Err.Error()
 				break outer
 			}
-			// todo(fs): honor ctx
-			c.msgChan <- msg
+			if cause := c.dispatch(ctx, msg); cause != "" {
+				closeCause = cause
+				if cause == "dispatch_timeout" {
+					closeErr = fmt.Sprintf("request dispatcher did not accept a message within %s", c.dispatchTimeout)
+					emitDiagWarn(c.logger, diagPayload{
+						Event:           "channel_dispatch_timeout",
+						SecureChannelID: secureChannelID,
+						RemoteAddr:      remoteAddr(sc),
+						ErrorText:       closeErr,
+					})
+					// Closing the TCP connection first makes the secure channel's
+					// own close fail fast instead of writing to a peer that may
+					// not be reading.
+					conn.Close()
+					sc.Close()
+				}
+				break outer
+			}
 		}
 	}
 
@@ -142,6 +183,8 @@ outer:
 			c.logger.Warn("Context done, closing Secure Channel %d", secureChannelID)
 		case "eof":
 			c.logger.Warn("Secure Channel %d closed", secureChannelID)
+		case "dispatch_timeout":
+			c.logger.Warn("Secure Channel %d closed: %s", secureChannelID, closeErr)
 		default:
 			c.logger.Error("Secure Channel %d error: %s", secureChannelID, closeErr)
 		}
