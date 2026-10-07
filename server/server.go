@@ -194,6 +194,12 @@ func (s *Server) ChangeNotification(n *ua.NodeID) {
 	s.MonitoredItemService.ChangeNotification(n)
 }
 
+// ChangeNotifications is the batch form of ChangeNotification, for a caller that
+// changes many nodes at once and would otherwise pay one lock acquisition each.
+func (s *Server) ChangeNotifications(nodes []*ua.NodeID) {
+	s.MonitoredItemService.ChangeNotifications(nodes)
+}
+
 // for now, the address space of the server is split up into namespaces.
 // this means that when we look up a node, we need to ask the specific namespace
 // it belongs to for it instead of just a general lookup by ID
