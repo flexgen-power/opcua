@@ -259,8 +259,8 @@ type PubReq struct {
 // This is the type that with its run() function will work in the bakground fullfilling subscription
 // publishes.
 //
-// MonitoredItems will send updates on the NotifyChannel to let the background task know that
-// an event has occured that needs to be published.
+// MonitoredItems hand updates to Notify, which records the latest value per client handle and
+// wakes the background task so it can be published.
 type Subscription struct {
 	srv                       *SubscriptionService
 	Session                   *session
@@ -273,8 +273,16 @@ type Subscription struct {
 	//SeqNums                   map[uint32]struct{}
 	T *time.Ticker
 
-	NotifyChannel chan *ua.MonitoredItemNotification
 	ModifyChannel chan *ua.ModifySubscriptionRequest
+
+	// pending holds the newest undelivered notification per client handle. It is
+	// written by Notify on the caller's goroutine and drained by run(), so a
+	// subscriber that has stopped draining can never block the producer, and its
+	// backlog is bounded by its monitored item count rather than by event rate.
+	// pendingMu is a leaf lock: nothing else is acquired while it is held.
+	pendingMu sync.Mutex
+	pending   map[uint32]*ua.MonitoredItemNotification
+	wake      chan struct{}
 
 	// the running flag and shutdown channel are used to signal the background task that it should stop.
 	// multiple places can kill the subscription so make sure you check the running flag using the mutex
@@ -287,10 +295,58 @@ type Subscription struct {
 func NewSubscription() *Subscription {
 	return &Subscription{
 		//SeqNums:       map[uint32]struct{}{},
-		NotifyChannel: make(chan *ua.MonitoredItemNotification, 100),
 		ModifyChannel: make(chan *ua.ModifySubscriptionRequest, 2),
+		pending:       make(map[uint32]*ua.MonitoredItemNotification),
+		wake:          make(chan struct{}, 1),
 		shutdown:      make(chan struct{}),
 	}
+}
+
+// Notify queues n for the next publish, replacing any not-yet-published
+// notification for the same client handle. It never blocks on the subscriber
+// and is a no-op once the subscription has shut down.
+func (s *Subscription) Notify(n *ua.MonitoredItemNotification) {
+	s.pendingMu.Lock()
+	select {
+	case <-s.shutdown:
+		s.pendingMu.Unlock()
+		return
+	default:
+	}
+	s.pending[n.ClientHandle] = n
+	s.pendingMu.Unlock()
+
+	select {
+	case s.wake <- struct{}{}:
+	default:
+	}
+}
+
+// PendingNotifications reports how many monitored items have a notification
+// waiting to be picked up by the subscription's publish loop.
+func (s *Subscription) PendingNotifications() int {
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	return len(s.pending)
+}
+
+// drainPending moves every pending notification into q, newest value winning.
+func (s *Subscription) drainPending(q map[uint32]*ua.MonitoredItemNotification) {
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	for h, n := range s.pending {
+		q[h] = n
+	}
+	clear(s.pending)
+}
+
+// dropPending discards anything still pending once the subscription is gone.
+// Notify checks shutdown under pendingMu, so once shutdown is closed nothing
+// more can be added.
+func (s *Subscription) dropPending() {
+	s.pendingMu.Lock()
+	clear(s.pending)
+	s.pendingMu.Unlock()
 }
 
 func (s *Subscription) Update(req *ua.ModifySubscriptionRequest) {
@@ -346,6 +402,7 @@ func (s *Subscription) run() {
 			s.srv.srv.cfg.logger.Info("Subscription %d shutting down.", s.ID)
 		}
 		s.srv.DeleteSubscription(s.ID)
+		s.dropPending()
 	}()
 
 	keepalive_counter := 0
@@ -376,9 +433,10 @@ func (s *Subscription) run() {
 			select {
 			case <-s.shutdown:
 				return
-			case newNotification := <-s.NotifyChannel:
-				publishQueue[newNotification.ClientHandle] = newNotification
+			case <-s.wake:
+				s.drainPending(publishQueue)
 			case <-s.T.C:
+				s.drainPending(publishQueue)
 				if len(publishQueue) == 0 {
 					// nothing to publish, increment the keepalive counter and send a keepalive if it
 					// has been enough intervals.
@@ -423,8 +481,8 @@ func (s *Subscription) run() {
 			case pubreq = <-s.Session.PublishRequests:
 				// once we get a publish request, we should move on to publish them back
 				break L2
-			case newNotification := <-s.NotifyChannel:
-				publishQueue[newNotification.ClientHandle] = newNotification
+			case <-s.wake:
+				s.drainPending(publishQueue)
 
 			case <-s.T.C:
 				// we had another tick without a publish request.
@@ -439,6 +497,10 @@ func (s *Subscription) run() {
 		}
 		lifetime_counter = 0
 		keepalive_counter = 0
+
+		// pick up anything that arrived after the last wake so this response
+		// carries the newest values available right now.
+		s.drainPending(publishQueue)
 
 		s.SequenceID++
 		if s.SequenceID == 0 {
