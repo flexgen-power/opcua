@@ -40,8 +40,6 @@ func (s *SubscriptionService) nextID() uint32 {
 // get rid of all references to a subscription and all monitored items that are pointed at this subscription.
 func (s *SubscriptionService) DeleteSubscription(id uint32) {
 	s.Mu.Lock()
-	defer s.Mu.Unlock()
-
 	sub, ok := s.Subs[id]
 	if ok {
 		sub.Mu.Lock()
@@ -51,12 +49,18 @@ func (s *SubscriptionService) DeleteSubscription(id uint32) {
 		}
 		sub.Mu.Unlock()
 	}
-
 	delete(s.Subs, id)
+	// Release Mu before purging monitored items: CreateMonitoredItems takes
+	// MonitoredItemService.Mu and then this Mu, so purging while holding Mu
+	// (DeleteSub takes MonitoredItemService.Mu) was an ABBA deadlock that wedged
+	// the single request dispatcher and every ingest delivery. The subscription is
+	// already out of Subs, so a CreateMonitoredItems that looked it up first adds
+	// its items before the purge below removes them, and one that looks it up
+	// later fails the lookup.
+	s.Mu.Unlock()
 
 	// ask the monitored item service to purge out any items that use this subscription
 	s.srv.MonitoredItemService.DeleteSub(id)
-
 }
 
 // https://reference.opcfoundation.org/Core/Part4/v105/docs/5.13.2
