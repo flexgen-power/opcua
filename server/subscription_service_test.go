@@ -57,6 +57,49 @@ func TestCreateSubscriptionNeverReissuesLiveID(t *testing.T) {
 	}
 }
 
+// TestDeleteSubscriptionDoesNotHoldMuWhilePurgingItems covers the lock-order
+// inversion between CreateMonitoredItems (MonitoredItemService.Mu, then
+// SubscriptionService.Mu) and DeleteSubscription (SubscriptionService.Mu, then
+// MonitoredItemService.Mu inside DeleteSub). The test holds
+// MonitoredItemService.Mu as CreateMonitoredItems does and deletes a
+// subscription; SubscriptionService.Mu must still become free, or the two
+// deadlock and wedge the request dispatcher and ingest.
+func TestDeleteSubscriptionDoesNotHoldMuWhilePurgingItems(t *testing.T) {
+	srv := New()
+	srv.initHandlers()
+	id := createTestSubscription(t, srv, srv.sb.NewSession())
+
+	srv.MonitoredItemService.Mu.Lock()
+	deleted := make(chan struct{})
+	go func() {
+		defer close(deleted)
+		srv.SubscriptionService.DeleteSubscription(id)
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if srv.SubscriptionService.Mu.TryLock() {
+			_, live := srv.SubscriptionService.Subs[id]
+			srv.SubscriptionService.Mu.Unlock()
+			if !live {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			srv.MonitoredItemService.Mu.Unlock()
+			<-deleted
+			t.Fatal("DeleteSubscription held SubscriptionService.Mu while waiting for MonitoredItemService.Mu")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	srv.MonitoredItemService.Mu.Unlock()
+	select {
+	case <-deleted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("DeleteSubscription did not finish once MonitoredItemService.Mu was free")
+	}
+}
+
 func TestNextIDSkipsZeroAndLiveIDsOnWraparound(t *testing.T) {
 	s := &SubscriptionService{Subs: map[uint32]*Subscription{1: {}, 2: {}}}
 	s.lastID = math.MaxUint32 - 1
