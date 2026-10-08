@@ -157,12 +157,15 @@ func (s *SessionService) CloseSession(sc *uasc.SecureChannel, r ua.Request, reqI
 		return nil, err
 	}
 
+	sess := s.srv.Session(req.RequestHeader)
 	err = s.srv.sb.Close(req.RequestHeader.AuthenticationToken)
 	if err != nil {
 		return nil, ua.StatusBadSessionIDInvalid
 	}
+	if req.DeleteSubscriptions && sess != nil {
+		s.srv.SubscriptionService.deleteSessionSubscriptions(sess)
+	}
 
-	//TODO: deal with 'delete subscriptions' field in request
 	response := &ua.CloseSessionResponse{
 		ResponseHeader: responseHeader(req.RequestHeader.RequestHandle, ua.StatusOK),
 	}
