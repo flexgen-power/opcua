@@ -67,8 +67,9 @@ type serverConfig struct {
 	enabledSec  []security
 	enabledAuth []authMode
 
-	cap                  ServerCapabilities
-	responseWriteTimeout time.Duration
+	cap                    ServerCapabilities
+	responseWriteTimeout   time.Duration
+	requestDispatchTimeout time.Duration
 
 	logger Logger
 }
@@ -100,12 +101,13 @@ type security struct {
 // Call Start() afterwards to begin listening and serving connections
 func New(opts ...Option) *Server {
 	cfg := &serverConfig{
-		cap:                  capabilities,
-		applicationName:      "GOPCUA",               // override with the ServerName option
-		manufacturerName:     "The gopcua Team",      // override with the ManufacturerName option
-		productName:          "gopcua OPC/UA Server", // override with the ProductName option
-		softwareVersion:      "0.0.0-dev",            // override with the SoftwareVersion option
-		responseWriteTimeout: 10 * time.Second,
+		cap:                    capabilities,
+		applicationName:        "GOPCUA",               // override with the ServerName option
+		manufacturerName:       "The gopcua Team",      // override with the ManufacturerName option
+		productName:            "gopcua OPC/UA Server", // override with the ProductName option
+		softwareVersion:        "0.0.0-dev",            // override with the SoftwareVersion option
+		responseWriteTimeout:   10 * time.Second,
+		requestDispatchTimeout: 30 * time.Second,
 	}
 	for _, opt := range opts {
 		opt(cfg)
@@ -118,7 +120,7 @@ func New(opts ...Option) *Server {
 	s := &Server{
 		url:      url,
 		cfg:      cfg,
-		cb:       newChannelBroker(cfg.logger, cfg.responseWriteTimeout),
+		cb:       newChannelBroker(cfg.logger, cfg.responseWriteTimeout, cfg.requestDispatchTimeout),
 		sb:       newSessionBroker(cfg.logger),
 		handlers: make(map[uint16]Handler),
 		namespaces: []NameSpace{
@@ -270,7 +272,7 @@ func (s *Server) Start(ctx context.Context) error {
 	s.setServerState(ua.ServerStateRunning)
 
 	if s.cb == nil {
-		s.cb = newChannelBroker(s.cfg.logger, s.cfg.responseWriteTimeout)
+		s.cb = newChannelBroker(s.cfg.logger, s.cfg.responseWriteTimeout, s.cfg.requestDispatchTimeout)
 	}
 
 	go s.acceptAndRegister(ctx, s.l)

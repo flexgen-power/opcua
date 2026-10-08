@@ -133,6 +133,19 @@ func ResponseWriteTimeout(timeout time.Duration) Option {
 	}
 }
 
+// RequestDispatchTimeout bounds how long a connection's reader waits to hand a
+// received message to the server's request dispatcher while the dispatcher
+// accepts no messages from any connection. When it expires the connection is
+// closed, so a stalled dispatcher cannot pin one blocked reader goroutine per
+// connection indefinitely. Time spent queued behind other connections while
+// the dispatcher keeps making progress does not count. A non-positive value
+// disables the bound.
+func RequestDispatchTimeout(timeout time.Duration) Option {
+	return func(s *serverConfig) {
+		s.requestDispatchTimeout = timeout
+	}
+}
+
 func ServerName(name string) Option {
 	return func(s *serverConfig) {
 		s.applicationName = name
