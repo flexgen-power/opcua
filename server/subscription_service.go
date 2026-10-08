@@ -398,14 +398,22 @@ func (s *Subscription) dropPending() {
 	s.pendingMu.Unlock()
 }
 
-// minPublishingInterval is the shortest publishing interval, in milliseconds,
-// the server grants. A zero or sub-millisecond request would otherwise reach
-// time.NewTicker as a zero duration, which panics and takes the process down.
-const minPublishingInterval = 10.0
+// minPublishingInterval and maxPublishingInterval bound the publishing
+// interval, in milliseconds, the server grants. Outside them the interval
+// reaches time.NewTicker as a zero (sub-millisecond request) or overflowed,
+// negative (huge or +Inf request) duration, which panics and takes the process
+// down.
+const (
+	minPublishingInterval = 10.0
+	maxPublishingInterval = float64(time.Hour / time.Millisecond)
+)
 
 func revisePublishingInterval(requested float64) float64 {
-	if !(requested >= minPublishingInterval) { // also catches NaN
+	switch {
+	case !(requested >= minPublishingInterval): // also catches NaN
 		return minPublishingInterval
+	case requested > maxPublishingInterval:
+		return maxPublishingInterval
 	}
 	return requested
 }

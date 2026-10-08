@@ -2,6 +2,7 @@ package server
 
 import (
 	"errors"
+	"math"
 	"testing"
 	"time"
 
@@ -96,6 +97,29 @@ func TestCreateSubscriptionRevisesAZeroPublishingInterval(t *testing.T) {
 		t.Fatalf("revised publishing interval %v, want %v", created.RevisedPublishingInterval, minPublishingInterval)
 	}
 	time.Sleep(5 * minPublishingInterval * time.Millisecond) // let run() tick
+}
+
+// Huge and infinite intervals overflowed to a negative duration, which also
+// panics time.NewTicker.
+func TestRevisePublishingIntervalBoundsEveryRequest(t *testing.T) {
+	for requested, want := range map[float64]float64{
+		0:                     minPublishingInterval,
+		-5:                    minPublishingInterval,
+		math.NaN():            minPublishingInterval,
+		250:                   250,
+		1e15:                  maxPublishingInterval,
+		math.Inf(1):           maxPublishingInterval,
+		math.Inf(-1):          minPublishingInterval,
+		maxPublishingInterval: maxPublishingInterval,
+	} {
+		got := revisePublishingInterval(requested)
+		if got != want {
+			t.Fatalf("revisePublishingInterval(%v) = %v, want %v", requested, got, want)
+		}
+		if d := time.Millisecond * time.Duration(got); d <= 0 {
+			t.Fatalf("revised interval %v ms still gives a non-positive ticker duration %v", got, d)
+		}
+	}
 }
 
 // CloseSession with DeleteSubscriptions set must delete the session's
