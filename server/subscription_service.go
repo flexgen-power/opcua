@@ -17,13 +17,29 @@ type SubscriptionService struct {
 	// pub sub stuff
 	Mu   sync.Mutex
 	Subs map[uint32]*Subscription
+	// lastID is the most recently issued subscription ID; guarded by Mu.
+	lastID uint32
+}
+
+// nextID returns a subscription ID that no live subscription holds. IDs only
+// increase, so a deleted ID is not reissued while its client may still use it.
+// Deriving the ID from the live count instead reissued another client's live ID
+// after any delete: the new subscription overwrote it in Subs, and whichever of
+// the two shut down first deleted the other along with its monitored items.
+// Mu must be held.
+func (s *SubscriptionService) nextID() uint32 {
+	for {
+		s.lastID++
+		// 0 is not a valid subscription ID; skip it, and any ID still live, on wraparound
+		if _, live := s.Subs[s.lastID]; s.lastID != 0 && !live {
+			return s.lastID
+		}
+	}
 }
 
 // get rid of all references to a subscription and all monitored items that are pointed at this subscription.
 func (s *SubscriptionService) DeleteSubscription(id uint32) {
 	s.Mu.Lock()
-	defer s.Mu.Unlock()
-
 	sub, ok := s.Subs[id]
 	if ok {
 		sub.Mu.Lock()
@@ -33,12 +49,36 @@ func (s *SubscriptionService) DeleteSubscription(id uint32) {
 		}
 		sub.Mu.Unlock()
 	}
-
 	delete(s.Subs, id)
+	// Release Mu before purging monitored items: CreateMonitoredItems takes
+	// MonitoredItemService.Mu and then this Mu, so purging while holding Mu
+	// (DeleteSub takes MonitoredItemService.Mu) was an ABBA deadlock that wedged
+	// the single request dispatcher and every ingest delivery. The subscription is
+	// already out of Subs, so a CreateMonitoredItems that looked it up first adds
+	// its items before the purge below removes them, and one that looks it up
+	// later fails the lookup.
+	s.Mu.Unlock()
 
 	// ask the monitored item service to purge out any items that use this subscription
 	s.srv.MonitoredItemService.DeleteSub(id)
+}
 
+// deleteSessionSubscriptions deletes every subscription owned by sess, as
+// CloseSession does when the client sets DeleteSubscriptions. Left running,
+// they would keep a closed session's monitored items alive until their
+// lifetime expired.
+func (s *SubscriptionService) deleteSessionSubscriptions(sess *session) {
+	s.Mu.Lock()
+	var ids []uint32
+	for id, sub := range s.Subs {
+		if sub.Session == sess {
+			ids = append(ids, id)
+		}
+	}
+	s.Mu.Unlock()
+	for _, id := range ids {
+		s.DeleteSubscription(id)
+	}
 }
 
 // https://reference.opcfoundation.org/Core/Part4/v105/docs/5.13.2
@@ -51,11 +91,17 @@ func (s *SubscriptionService) CreateSubscription(sc *uasc.SecureChannel, r ua.Re
 	if err != nil {
 		return nil, err
 	}
+	// run() reads the session's publish queue, so a subscription without a
+	// session would panic the first time it has something to send.
+	session := s.srv.Session(r.Header())
+	if session == nil {
+		return nil, ua.StatusBadSessionIDInvalid
+	}
 
 	s.Mu.Lock()
 	defer s.Mu.Unlock()
 
-	newsubid := uint32(len(s.Subs)) + 1
+	newsubid := s.nextID()
 
 	if s.srv.cfg.logger != nil {
 		s.srv.cfg.logger.Info("New Sub %d for %v", newsubid, sc.RemoteAddr())
@@ -63,10 +109,10 @@ func (s *SubscriptionService) CreateSubscription(sc *uasc.SecureChannel, r ua.Re
 
 	sub := NewSubscription()
 	sub.srv = s
-	sub.Session = s.srv.Session(r.Header())
+	sub.Session = session
 	sub.Channel = sc
 	sub.ID = newsubid
-	sub.RevisedPublishingInterval = req.RequestedPublishingInterval
+	sub.RevisedPublishingInterval = revisePublishingInterval(req.RequestedPublishingInterval)
 	sub.RevisedLifetimeCount = req.RequestedLifetimeCount
 	sub.RevisedMaxKeepAliveCount = req.RequestedMaxKeepAliveCount
 
@@ -84,7 +130,7 @@ func (s *SubscriptionService) CreateSubscription(sc *uasc.SecureChannel, r ua.Re
 			AdditionalHeader:   ua.NewExtensionObject(nil),
 		},
 		SubscriptionID:            uint32(newsubid),
-		RevisedPublishingInterval: req.RequestedPublishingInterval,
+		RevisedPublishingInterval: sub.RevisedPublishingInterval,
 		RevisedLifetimeCount:      req.RequestedLifetimeCount,
 		RevisedMaxKeepAliveCount:  req.RequestedMaxKeepAliveCount,
 	}
@@ -209,6 +255,9 @@ func (s *SubscriptionService) DeleteSubscriptions(sc *uasc.SecureChannel, r ua.R
 		return nil, err
 	}
 	session := s.srv.Session(req.Header())
+	if session == nil {
+		return nil, ua.StatusBadSessionIDInvalid
+	}
 
 	s.Mu.Lock()
 	defer s.Mu.Unlock()
@@ -349,8 +398,28 @@ func (s *Subscription) dropPending() {
 	s.pendingMu.Unlock()
 }
 
+// minPublishingInterval and maxPublishingInterval bound the publishing
+// interval, in milliseconds, the server grants. Outside them the interval
+// reaches time.NewTicker as a zero (sub-millisecond request) or overflowed,
+// negative (huge or +Inf request) duration, which panics and takes the process
+// down.
+const (
+	minPublishingInterval = 10.0
+	maxPublishingInterval = float64(time.Hour / time.Millisecond)
+)
+
+func revisePublishingInterval(requested float64) float64 {
+	switch {
+	case !(requested >= minPublishingInterval): // also catches NaN
+		return minPublishingInterval
+	case requested > maxPublishingInterval:
+		return maxPublishingInterval
+	}
+	return requested
+}
+
 func (s *Subscription) Update(req *ua.ModifySubscriptionRequest) {
-	s.RevisedPublishingInterval = req.RequestedPublishingInterval
+	s.RevisedPublishingInterval = revisePublishingInterval(req.RequestedPublishingInterval)
 	s.RevisedLifetimeCount = req.RequestedLifetimeCount
 	s.RevisedMaxKeepAliveCount = req.RequestedMaxKeepAliveCount
 }

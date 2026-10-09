@@ -291,6 +291,9 @@ func (s *MonitoredItemService) CreateMonitoredItems(sc *uasc.SecureChannel, r ua
 	}
 
 	sess := s.SubService.srv.Session(req.RequestHeader)
+	if sess == nil {
+		return nil, ua.StatusBadSessionIDInvalid
+	}
 	if sub.Session.AuthTokenID.String() != sess.AuthTokenID.String() {
 		return nil, errors.New("not your subscription, bro")
 	}
@@ -388,14 +391,15 @@ func (s *MonitoredItemService) SetMonitoringMode(sc *uasc.SecureChannel, r ua.Re
 
 	for i := range req.MonitoredItemIDs {
 		id := req.MonitoredItemIDs[i]
+		// Check the item exists before dereferencing it: a client can name an item
+		// the server already purged (subscription deleted or timed out).
 		item, ok := s.Items[id]
-
-		if item.Sub.Session.AuthTokenID.String() != sess.AuthTokenID.String() {
-			results[i] = ua.StatusBadSessionIDInvalid
-		}
-
 		if !ok {
 			results[i] = ua.StatusBadMonitoredItemIDInvalid
+			continue
+		}
+		if sess == nil || item.Sub.Session.AuthTokenID.String() != sess.AuthTokenID.String() {
+			results[i] = ua.StatusBadSessionIDInvalid
 			continue
 		}
 		item.Mode = req.MonitoringMode
@@ -449,13 +453,16 @@ func (s *MonitoredItemService) DeleteMonitoredItems(sc *uasc.SecureChannel, r ua
 	results := make([]ua.StatusCode, len(req.MonitoredItemIDs))
 	for i := range req.MonitoredItemIDs {
 		id := req.MonitoredItemIDs[i]
+		// Check the item exists before dereferencing it: a client can name an item
+		// the server already purged (subscription deleted or timed out).
 		item, ok := s.Items[id]
 		if !ok {
 			results[i] = ua.StatusBadMonitoredItemIDInvalid
+			continue
 		}
-
-		if item.Sub.Session.AuthTokenID.String() != sess.AuthTokenID.String() {
+		if sess == nil || item.Sub.Session.AuthTokenID.String() != sess.AuthTokenID.String() {
 			results[i] = ua.StatusBadSessionIDInvalid
+			continue
 		}
 
 		// this function gets the lock so we need to do it in the background so it can happen after our lock is released.
