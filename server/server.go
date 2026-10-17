@@ -67,6 +67,11 @@ type serverConfig struct {
 	enabledSec  []security
 	enabledAuth []authMode
 
+	// authenticator decides UserName and Certificate identity tokens; nil
+	// rejects them all. clientCertValidator vets application certificates.
+	authenticator       Authenticator
+	clientCertValidator func(cert []byte) error
+
 	cap                    ServerCapabilities
 	responseWriteTimeout   time.Duration
 	requestDispatchTimeout time.Duration
@@ -142,6 +147,7 @@ func New(opts ...Option) *Server {
 			ShutdownReason:      &ua.LocalizedText{},
 		},
 	}
+	s.cb.certValidator = cfg.clientCertValidator
 
 	// init server address space
 	//for _, n := range PredefinedNodes() {
@@ -273,6 +279,7 @@ func (s *Server) Start(ctx context.Context) error {
 
 	if s.cb == nil {
 		s.cb = newChannelBroker(s.cfg.logger, s.cfg.responseWriteTimeout, s.cfg.requestDispatchTimeout)
+		s.cb.certValidator = s.cfg.clientCertValidator
 	}
 
 	go s.acceptAndRegister(ctx, s.l)

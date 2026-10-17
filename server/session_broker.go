@@ -3,6 +3,7 @@ package server
 import (
 	mrand "math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -17,6 +18,15 @@ type session struct {
 	AuthTokenID       *ua.NodeID
 	serverNonce       []byte
 	remoteCertificate []byte
+
+	// createChannelID is the secure channel CreateSession arrived on; the
+	// first ActivateSession must use the same one (Part 4, 5.6.3.1).
+	createChannelID uint32
+	// activated is set once ActivateSession accepts an identity, and
+	// channelID is the channel the session is then bound to. Only an
+	// activated session may call services, and only on its bound channel.
+	activated atomic.Bool
+	channelID atomic.Uint32
 
 	PublishRequests chan PubReq
 }
