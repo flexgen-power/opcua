@@ -124,7 +124,11 @@ func (s *Server) handleService(ctx context.Context, sc *uasc.SecureChannel, reqI
 	typeID := ua.ServiceTypeID(req)
 	h, ok := s.handlers[typeID]
 	if ok {
-		resp, err = h(sc, req, reqID)
+		if code := s.checkSession(sc, typeID, req); code != ua.StatusOK {
+			err = code
+		} else {
+			resp, err = h(sc, req, reqID)
+		}
 	} else {
 		if typeID == 0 {
 			if s.cfg.logger != nil {
@@ -178,6 +182,45 @@ func (s *Server) handleService(ctx context.Context, sc *uasc.SecureChannel, reqI
 			s.cfg.logger.Warn("Error sending response: %s\n", err)
 		}
 	}
+}
+
+// sessionlessServices may be called without an activated session: discovery,
+// and the session services that create, activate, close or cancel one.
+var sessionlessServices = map[uint16]bool{
+	id.FindServersRequest_Encoding_DefaultBinary:          true,
+	id.FindServersOnNetworkRequest_Encoding_DefaultBinary: true,
+	id.GetEndpointsRequest_Encoding_DefaultBinary:         true,
+	id.RegisterServerRequest_Encoding_DefaultBinary:       true,
+	id.RegisterServer2Request_Encoding_DefaultBinary:      true,
+	id.CreateSessionRequest_Encoding_DefaultBinary:        true,
+	id.ActivateSessionRequest_Encoding_DefaultBinary:      true,
+	id.CloseSessionRequest_Encoding_DefaultBinary:         true,
+	id.CancelRequest_Encoding_DefaultBinary:               true,
+}
+
+// checkSession enforces that every other service runs on a session that
+// ActivateSession accepted, over the channel it was activated on
+// (Part 4, 5.6.3.1). Without this, a client could skip ActivateSession, and
+// with it authentication, and still read and subscribe.
+func (s *Server) checkSession(sc *uasc.SecureChannel, typeID uint16, req ua.Request) ua.StatusCode {
+	if sessionlessServices[typeID] {
+		return ua.StatusOK
+	}
+	hdr := req.Header()
+	if hdr == nil || hdr.AuthenticationToken == nil {
+		return ua.StatusBadSessionIDInvalid
+	}
+	sess := s.sb.Session(hdr.AuthenticationToken)
+	if sess == nil {
+		return ua.StatusBadSessionIDInvalid
+	}
+	if !sess.activated.Load() {
+		return ua.StatusBadSessionNotActivated
+	}
+	if sess.channelID.Load() != sc.ID() {
+		return ua.StatusBadSecureChannelIDInvalid
+	}
+	return ua.StatusOK
 }
 
 func responseHeader(reqID uint32, statusCode ua.StatusCode) *ua.ResponseHeader {
