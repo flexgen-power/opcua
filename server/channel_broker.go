@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"crypto/rsa"
+	"errors"
 	"fmt"
 	"io"
 	mrand "math/rand"
@@ -36,6 +37,8 @@ type channelBroker struct {
 	msgChan              chan *uasc.MessageBody
 	logger               Logger
 	responseWriteTimeout time.Duration
+	// certValidator vets a client application certificate on OpenSecureChannel.
+	certValidator func(cert []byte) error
 
 	// dispatchTimeout is how long a reader waits to hand off a message while
 	// the dispatcher accepts nothing at all; non-positive disables it.
@@ -114,6 +117,7 @@ func (c *channelBroker) RegisterConn(ctx context.Context, conn *uacp.Conn, local
 	cfg.LocalKey = localKey
 	cfg.Logger = c.logger
 	cfg.ResponseWriteTimeout = c.responseWriteTimeout
+	cfg.RemoteCertificateValidator = c.certValidator
 
 	c.mu.Lock()
 	c.secureChannelID++
@@ -169,10 +173,23 @@ outer:
 			msg := sc.Receive(ctx)
 			if msg.Err == io.EOF {
 				closeCause = "eof"
+				conn.Close()
+				sc.Close()
 				break outer
 			} else if msg.Err != nil {
 				closeCause = "error"
 				closeErr = msg.Err.Error()
+				// Nothing reads this channel after the loop exits, so leaving
+				// the socket open strands the client until its own timeout.
+				// Tell it why, then close (Part 6, 7.1.2.4 / 7.1.3).
+				code := ua.StatusBadSecureChannelClosed
+				var status ua.StatusCode
+				if errors.As(msg.Err, &status) {
+					code = status
+				}
+				conn.SendError(code)
+				conn.Close()
+				sc.Close()
 				break outer
 			}
 			if cause := c.dispatch(ctx, msg); cause != "" {
