@@ -490,6 +490,16 @@ func (s *SecureChannel) readChunk() (*MessageChunk, error) {
 
 		s.cfg.SecurityPolicyURI = m.SecurityPolicyURI
 		if m.SecurityPolicyURI != ua.SecurityPolicyURINone {
+			if v := s.cfg.RemoteCertificateValidator; v != nil {
+				if err := v(m.AsymmetricSecurityHeader.SenderCertificate); err != nil {
+					debug.Printf("uasc %d: rejected peer certificate: %s", s.c.ID(), err)
+					var code ua.StatusCode
+					if errors.As(err, &code) {
+						return nil, code
+					}
+					return nil, ua.StatusBadSecurityChecksFailed
+				}
+			}
 			s.cfg.RemoteCertificate = m.AsymmetricSecurityHeader.SenderCertificate
 			// Re-derive the receiver thumbprint from the peer certificate
 			// learned in the inbound OPN. No-op for the client path, where
