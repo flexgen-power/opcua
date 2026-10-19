@@ -9,6 +9,7 @@ import (
 	"crypto/rsa"
 	"crypto/subtle"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 
 	"github.com/gopcua/opcua/ua"
@@ -73,6 +74,10 @@ type identityResult struct {
 	tokenType ua.UserTokenType
 	policyID  string
 	username  string
+	// key names who the session is activated as, so a later activation can be
+	// checked to be the same identity: "anonymous", "user:<name>" or
+	// "cert:<thumbprint>".
+	key string
 }
 
 // authenticateIdentity resolves the identity token of an ActivateSession
@@ -114,6 +119,7 @@ func (s *SessionService) authenticateIdentity(sc *uasc.SecureChannel, sess *sess
 	}
 	res := identityResult{tokenType: tokenType, policyID: policy.PolicyID}
 	if tokenType == ua.UserTokenTypeAnonymous {
+		res.key = "anonymous"
 		return res, ua.StatusOK
 	}
 
@@ -148,12 +154,14 @@ func (s *SessionService) authenticateIdentity(sc *uasc.SecureChannel, sess *sess
 		id.Password = password
 		defer clear(password)
 		res.username = tok.UserName
+		res.key = "user:" + tok.UserName
 
 	case *ua.X509IdentityToken:
 		if code := s.verifyUserTokenSignature(sess, tokenPolicyURI, tok, req.UserTokenSignature); code != ua.StatusOK {
 			return identityResult{}, code
 		}
 		id.Certificate = tok.CertificateData
+		res.key = "cert:" + hex.EncodeToString(uapolicy.Thumbprint(tok.CertificateData))
 		if cert, err := uapolicy.ParseCertificate(tok.CertificateData); err == nil {
 			res.username = cert.Subject.String()
 		}

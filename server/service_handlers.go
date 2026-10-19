@@ -185,7 +185,8 @@ func (s *Server) handleService(ctx context.Context, sc *uasc.SecureChannel, reqI
 }
 
 // sessionlessServices may be called without an activated session: discovery,
-// and the session services that create, activate, close or cancel one.
+// and the session services that create, activate or cancel one. CloseSession is
+// not here: it is checked against the session's own channel (see checkSession).
 var sessionlessServices = map[uint16]bool{
 	id.FindServersRequest_Encoding_DefaultBinary:          true,
 	id.FindServersOnNetworkRequest_Encoding_DefaultBinary: true,
@@ -194,7 +195,6 @@ var sessionlessServices = map[uint16]bool{
 	id.RegisterServer2Request_Encoding_DefaultBinary:      true,
 	id.CreateSessionRequest_Encoding_DefaultBinary:        true,
 	id.ActivateSessionRequest_Encoding_DefaultBinary:      true,
-	id.CloseSessionRequest_Encoding_DefaultBinary:         true,
 	id.CancelRequest_Encoding_DefaultBinary:               true,
 }
 
@@ -207,14 +207,29 @@ func (s *Server) checkSession(sc *uasc.SecureChannel, typeID uint16, req ua.Requ
 		return ua.StatusOK
 	}
 	hdr := req.Header()
+	closing := typeID == id.CloseSessionRequest_Encoding_DefaultBinary
 	if hdr == nil || hdr.AuthenticationToken == nil {
+		if closing {
+			return ua.StatusOK // nothing to close; the handler answers
+		}
 		return ua.StatusBadSessionIDInvalid
 	}
 	sess := s.sb.Session(hdr.AuthenticationToken)
 	if sess == nil {
+		if closing {
+			return ua.StatusOK // already gone; closing it again is not an error
+		}
 		return ua.StatusBadSessionIDInvalid
 	}
 	if !sess.activated.Load() {
+		if closing {
+			// A session that was never activated may be abandoned only from
+			// the channel that created it.
+			if sess.createChannelID == sc.ID() {
+				return ua.StatusOK
+			}
+			return ua.StatusBadSecureChannelIDInvalid
+		}
 		return ua.StatusBadSessionNotActivated
 	}
 	if sess.channelID.Load() != sc.ID() {
