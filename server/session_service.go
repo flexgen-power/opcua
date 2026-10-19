@@ -131,15 +131,16 @@ func (s *SessionService) ActivateSession(sc *uasc.SecureChannel, r ua.Request, r
 	}
 
 	peer := sc.PeerSecurity()
+	transfer := sess.activated.Load() && sc.ID() != sess.channelID.Load()
 	if !sess.activated.Load() {
 		if sc.ID() != sess.createChannelID {
 			return nil, ua.StatusBadSecureChannelIDInvalid
 		}
-	} else if sc.ID() != sess.channelID.Load() && peer.Mode != ua.MessageSecurityModeNone &&
-		!sameLeafCertificate(peer.Certificate, sess.remoteCertificate) {
-		// Moving a session to a new channel requires the same client
-		// application certificate (Part 4, 5.6.3.1).
-		return nil, ua.StatusBadSecurityChecksFailed
+	} else if transfer {
+		if code := sess.checkTransferChannel(peer); code != ua.StatusOK {
+			s.warn("ActivateSession from %s refused: session cannot move to this channel: %s", remoteAddr(sc), code)
+			return nil, code
+		}
 	}
 
 	if req.ClientSignature == nil {
@@ -158,6 +159,12 @@ func (s *SessionService) ActivateSession(sc *uasc.SecureChannel, r ua.Request, r
 		s.warn("ActivateSession from %s rejected: %s", remoteAddr(sc), code)
 		return nil, code
 	}
+	if transfer {
+		if code := sess.checkTransferIdentity(identity.key); code != ua.StatusOK {
+			s.warn("ActivateSession from %s refused: session cannot move to a different identity: %s", remoteAddr(sc), code)
+			return nil, code
+		}
+	}
 
 	nonce := make([]byte, sessionNonceLength)
 	if _, err := rand.Read(nonce); err != nil {
@@ -165,6 +172,8 @@ func (s *SessionService) ActivateSession(sc *uasc.SecureChannel, r ua.Request, r
 		return nil, ua.StatusBadInternalError
 	}
 	sess.serverNonce = nonce
+	sess.boundMode = peer.Mode
+	sess.identity = identity.key
 	sess.channelID.Store(sc.ID())
 	sess.activated.Store(true)
 	if s.srv.cfg.logger != nil {
