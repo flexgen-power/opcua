@@ -104,7 +104,11 @@ func (s *SessionService) authenticateIdentity(sc *uasc.SecureChannel, sess *sess
 		return identityResult{}, ua.StatusBadIdentityTokenInvalid
 	}
 
-	policy, ok := s.matchTokenPolicy(sc, tokenType, policyID)
+	// One snapshot for the whole decision: policy, mode and certificate are
+	// published together when the channel opens, never separately.
+	peer := sc.PeerSecurity()
+
+	policy, ok := s.matchTokenPolicy(peer, tokenType, policyID)
 	if !ok {
 		return identityResult{}, ua.StatusBadIdentityTokenInvalid
 	}
@@ -122,21 +126,21 @@ func (s *SessionService) authenticateIdentity(sc *uasc.SecureChannel, sess *sess
 	// channel's (Part 4, 7.41).
 	tokenPolicyURI := policy.SecurityPolicyURI
 	if tokenPolicyURI == "" {
-		tokenPolicyURI = sc.SecurityPolicyURI()
+		tokenPolicyURI = peer.PolicyURI
 	}
 
 	id := UserIdentity{
 		TokenType:         tokenType,
 		PolicyID:          policy.PolicyID,
-		ClientCertificate: sc.RemoteCertificate(),
-		SecurityPolicyURI: sc.SecurityPolicyURI(),
-		SecurityMode:      sc.SecurityMode(),
+		ClientCertificate: peer.Certificate,
+		SecurityPolicyURI: peer.PolicyURI,
+		SecurityMode:      peer.Mode,
 		RemoteAddr:        remoteAddr(sc),
 	}
 
 	switch tok := tokenValue.(type) {
 	case *ua.UserNameIdentityToken:
-		password, code := s.decryptUserPassword(sc, sess, tokenPolicyURI, tok)
+		password, code := s.decryptUserPassword(peer, sess, tokenPolicyURI, tok)
 		if code != ua.StatusOK {
 			return identityResult{}, code
 		}
@@ -168,8 +172,8 @@ func (s *SessionService) authenticateIdentity(sc *uasc.SecureChannel, sess *sess
 // matchTokenPolicy finds the advertised user token policy for the token, among
 // the endpoints whose security policy and mode match the channel. An anonymous
 // token with an empty policy ID matches any anonymous policy.
-func (s *SessionService) matchTokenPolicy(sc *uasc.SecureChannel, tokenType ua.UserTokenType, policyID string) (*ua.UserTokenPolicy, bool) {
-	chPolicy, chMode := sc.SecurityPolicyURI(), sc.SecurityMode()
+func (s *SessionService) matchTokenPolicy(peer uasc.PeerSecurity, tokenType ua.UserTokenType, policyID string) (*ua.UserTokenPolicy, bool) {
+	chPolicy, chMode := peer.PolicyURI, peer.Mode
 	if chPolicy == "" {
 		chPolicy = ua.SecurityPolicyURINone
 	}
@@ -193,10 +197,10 @@ func (s *SessionService) matchTokenPolicy(sc *uasc.SecureChannel, tokenType ua.U
 // The secret is the legacy encrypted-secret layout of Part 4, 7.41.2.2:
 // a little-endian uint32 length, the password, then the server nonce the
 // client was last given.
-func (s *SessionService) decryptUserPassword(sc *uasc.SecureChannel, sess *session, policyURI string, tok *ua.UserNameIdentityToken) ([]byte, ua.StatusCode) {
+func (s *SessionService) decryptUserPassword(peer uasc.PeerSecurity, sess *session, policyURI string, tok *ua.UserNameIdentityToken) ([]byte, ua.StatusCode) {
 	if policyURI == ua.SecurityPolicyURINone {
 		// A cleartext password is only acceptable inside an encrypted channel.
-		if sc.SecurityMode() != ua.MessageSecurityModeSignAndEncrypt {
+		if peer.Mode != ua.MessageSecurityModeSignAndEncrypt {
 			return nil, ua.StatusBadIdentityTokenRejected
 		}
 		if tok.EncryptionAlgorithm != "" {

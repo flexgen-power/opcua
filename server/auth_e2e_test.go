@@ -15,6 +15,8 @@ import (
 	"math/big"
 	"net"
 	"net/url"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -25,6 +27,9 @@ import (
 	"github.com/gopcua/opcua/id"
 	"github.com/gopcua/opcua/server"
 	"github.com/gopcua/opcua/ua"
+	"github.com/gopcua/opcua/uacp"
+	"github.com/gopcua/opcua/uapolicy"
+	"github.com/gopcua/opcua/uasc"
 )
 
 // These tests drive the gopcua client against the server over real sockets,
@@ -362,4 +367,151 @@ func TestServicesRequireActivatedSession(t *testing.T) {
 	r, err = send(read, token)
 	require.NoError(t, err)
 	require.Equal(t, ua.StatusOK, r.(*ua.ReadResponse).Results[0].Status)
+}
+
+// A channel renews its security token at 75% of its lifetime. The server reuses
+// one channel instance across renewals, so a renewal that swaps the live keys
+// while publishes are in flight breaks encrypted traffic. A 2 s lifetime makes
+// the client renew about every second.
+func TestRenewalUnderLoadKeepsEncryptedSubscriptionAlive(t *testing.T) {
+	ss := startSecureServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	defer cancel()
+
+	c := secureClient(t, ctx, ss, ua.UserTokenTypeUserName,
+		opcua.AuthUsername(testUser, testPassword), opcua.Lifetime(2*time.Second))
+	require.NoError(t, c.Connect(ctx))
+	defer c.Close(ctx)
+
+	notifs := make(chan *opcua.PublishNotificationData, 1024)
+	sub, err := c.Subscribe(ctx, &opcua.SubscriptionParameters{Interval: 20 * time.Millisecond}, notifs)
+	require.NoError(t, err)
+	defer sub.Cancel(ctx)
+	_, err = sub.Monitor(ctx, ua.TimestampsToReturnBoth, opcua.NewMonitoredItemCreateRequestWithDefaults(ss.node.ID(), ua.AttributeIDValue, 9))
+	require.NoError(t, err)
+
+	stop := make(chan struct{})
+	go func() {
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			case <-time.After(10 * time.Millisecond):
+				ss.soc.Store(float64(i))
+				ss.srv.ChangeNotification(ss.node.ID())
+			}
+		}
+	}()
+	defer close(stop)
+
+	var changes int
+	var last time.Time
+	end := time.After(9 * time.Second)
+loop:
+	for {
+		select {
+		case n := <-notifs:
+			require.NoError(t, n.Error, "subscription failed after %d changes", changes)
+			if dc, ok := n.Value.(*ua.DataChangeNotification); ok {
+				changes += len(dc.MonitoredItems)
+				last = time.Now()
+			}
+		case <-end:
+			break loop
+		}
+	}
+	require.Greater(t, changes, 100, "too few data changes over several renewals")
+	require.WithinDuration(t, time.Now(), last, 2*time.Second, "notifications stopped before the end")
+
+	// The session still works over the renewed channel.
+	resp, err := c.Read(ctx, &ua.ReadRequest{NodesToRead: []*ua.ReadValueID{{NodeID: ss.node.ID(), AttributeID: ua.AttributeIDValue}}})
+	require.NoError(t, err)
+	require.Equal(t, ua.StatusOK, resp.Results[0].Status)
+}
+
+// captureLogger records server log lines so a test can see why a channel closed.
+type captureLogger struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (l *captureLogger) add(level, msg string, args ...any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.lines = append(l.lines, level+" "+fmt.Sprintf(msg, args...))
+}
+func (l *captureLogger) Debug(msg string, args ...any) { l.add("DEBUG", msg, args...) }
+func (l *captureLogger) Info(msg string, args ...any)  { l.add("INFO", msg, args...) }
+func (l *captureLogger) Warn(msg string, args ...any)  { l.add("WARN", msg, args...) }
+func (l *captureLogger) Error(msg string, args ...any) { l.add("ERROR", msg, args...) }
+func (l *captureLogger) contains(sub string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, line := range l.lines {
+		if strings.Contains(line, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+// openRawChannel opens a SignAndEncrypt secure channel with the lower-level
+// client, keeping hold of its config so a test can change what the next
+// OpenSecureChannel asks for.
+func openRawChannel(t *testing.T, ctx context.Context, ss *secureServer) (*uasc.SecureChannel, *uasc.Config) {
+	t.Helper()
+	ep := endpointFor(t, ctx, ss.addr, ua.MessageSecurityModeSignAndEncrypt)
+	cert, key := genCert(t, "urn:gopcua:test:rawclient")
+	cfg := &uasc.Config{
+		SecurityPolicyURI: ep.SecurityPolicyURI,
+		SecurityMode:      ep.SecurityMode,
+		Certificate:       cert,
+		LocalKey:          key,
+		RemoteCertificate: ep.ServerCertificate,
+		Thumbprint:        uapolicy.Thumbprint(ep.ServerCertificate),
+		Lifetime:          uint32(time.Hour / time.Millisecond),
+		RequestTimeout:    3 * time.Second,
+	}
+	conn, err := uacp.Dial(ctx, ss.addr)
+	require.NoError(t, err)
+	sc, err := uasc.NewSecureChannel(ss.addr, conn, cfg, make(chan error, 8))
+	require.NoError(t, err)
+	require.NoError(t, sc.Open(ctx))
+	t.Cleanup(func() { _ = sc.Close() })
+	return sc, cfg
+}
+
+// A renewal keeps the security profile the channel was opened with. Without
+// that, a client authenticated on a SignAndEncrypt-only endpoint could renew
+// its channel as Sign (or None) and keep using the session unencrypted.
+func TestRenewalCannotChangeSecurityProfile(t *testing.T) {
+	cases := []struct {
+		name   string
+		change func(t *testing.T, cfg *uasc.Config)
+		want   string
+	}{
+		{"mode", func(t *testing.T, cfg *uasc.Config) { cfg.SecurityMode = ua.MessageSecurityModeSign }, "BadSecurityModeRejected"},
+		{"policy", func(t *testing.T, cfg *uasc.Config) { cfg.SecurityPolicyURI = ua.SecurityPolicyURIBasic128Rsa15 }, "BadSecurityPolicyRejected"},
+		{"client certificate", func(t *testing.T, cfg *uasc.Config) {
+			cfg.Certificate, cfg.LocalKey = genCert(t, "urn:gopcua:test:another-client")
+		}, "BadSecurityChecksFailed"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			log := &captureLogger{}
+			ss := startSecureServer(t, server.SetLogger(log))
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+
+			sc, cfg := openRawChannel(t, ctx, ss)
+			// Control: an unchanged renewal works, so the guard is not just
+			// refusing every renewal.
+			require.NoError(t, sc.Renew(ctx), "an unchanged renewal must succeed")
+
+			tc.change(t, cfg)
+			require.Error(t, sc.Renew(ctx), "a renewal that changes the profile must fail")
+			require.Eventually(t, func() bool { return log.contains(tc.want) }, 5*time.Second, 20*time.Millisecond,
+				"server did not refuse the renewal with %s", tc.want)
+		})
+	}
 }
