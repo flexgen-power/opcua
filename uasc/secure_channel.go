@@ -1149,14 +1149,17 @@ func (s *SecureChannel) writeMessageChunks(ctx context.Context, instance *channe
 	// Large service payloads may exceed a single UASC message body. Encode the
 	// full logical message up front, then stream each chunk in sequence while the
 	// caller holds the channel-instance lock.
-	//
-	// TODO: enforce the negotiated MaxMessageSize / MaxChunkCount here and abort
-	// with Bad_ResponseTooLarge instead of writing an over-limit chunk stream.
-	// These limits are already enforced on the receive path (see the chunk-count
-	// and message-size checks in Receive) but not on send (OPC UA Part 6 §6.7.2;
-	// cf. open62541 adjustCheckMessageLimitsSym, .NET MessageLimitsExceeded).
 	chunks, err := m.EncodeChunks(instance.maxBodySize)
 	if err != nil {
+		return 0, err
+	}
+
+	// The client said how many chunks and bytes a response may have. Check
+	// before anything is signed or written, so a response that cannot fit
+	// leaves the channel and its sequence numbers untouched and the caller can
+	// answer with a fault instead (Part 6, 6.7.2; cf. open62541
+	// adjustCheckMessageLimitsSym, .NET MessageLimitsExceeded).
+	if err := s.checkPeerLimits(instance, chunks); err != nil {
 		return 0, err
 	}
 
@@ -1234,6 +1237,47 @@ func (s *SecureChannel) SendMsgWithContext(ctx context.Context, instance *channe
 	return nil
 }
 
+// checkPeerLimits returns BadResponseTooLarge if the encoded chunks exceed the
+// chunk count or message size the client set in its Hello. Signing and
+// encryption add up to a signature and one cipher block to each chunk, which
+// the size check allows for so it never under-counts.
+func (s *SecureChannel) checkPeerLimits(instance *channelInstance, chunks [][]byte) error {
+	if maxChunks := s.c.PeerMaxChunkCount(); maxChunks > 0 && uint64(len(chunks)) > uint64(maxChunks) {
+		return ua.StatusBadResponseTooLarge
+	}
+	if maxSize := s.c.PeerMaxMessageSize(); maxSize > 0 {
+		overhead := 0
+		if instance.algo != nil {
+			overhead = instance.algo.SignatureLength() + instance.algo.BlockSize()
+		}
+		var total uint64
+		for _, c := range chunks {
+			total += uint64(len(c) + overhead)
+		}
+		if total > uint64(maxSize) {
+			return ua.StatusBadResponseTooLarge
+		}
+	}
+	return nil
+}
+
+// tooLargeFault is what a client gets when its response does not fit within
+// the limits it set.
+func (s *SecureChannel) tooLargeFault(resp ua.Response) *ua.ServiceFault {
+	var handle uint32
+	if h := resp.Header(); h != nil {
+		handle = h.RequestHandle
+	}
+	return &ua.ServiceFault{ResponseHeader: &ua.ResponseHeader{
+		Timestamp:          s.timeNow(),
+		RequestHandle:      handle,
+		ServiceResult:      ua.StatusBadResponseTooLarge,
+		ServiceDiagnostics: &ua.DiagnosticInfo{},
+		StringTable:        []string{},
+		AdditionalHeader:   ua.NewExtensionObject(nil),
+	}}
+}
+
 func (s *SecureChannel) sendResponseWithContext(ctx context.Context, instance *channelInstance, reqID uint32, resp ua.Response) error {
 	if ua.ServiceTypeID(resp) == 0 {
 		return errors.Errorf("uasc: unknown service %T. Did you call register?", resp)
@@ -1276,6 +1320,21 @@ func (s *SecureChannel) sendResponseLocked(ctx context.Context, instance *channe
 		return n, err
 	}
 	n, err := s.writeMessageChunks(ctx, instance, reqID, m, resp, writeChunk)
+	if code, ok := err.(ua.StatusCode); ok && code == ua.StatusBadResponseTooLarge {
+		// Nothing was written, so the message's sequence number is still
+		// unused: send the fault under it rather than leaving a gap.
+		emitDiagWarn(s.cfg.Logger, diagPayload{
+			Event:           "response_too_large",
+			ServiceType:     serviceType,
+			RequestID:       reqID,
+			SecureChannelID: instance.secureChannelID,
+			ErrorText:       "response exceeds the chunk count or message size the client accepts",
+		})
+		fault := s.tooLargeFault(resp)
+		m.TypeID = ua.NewFourByteExpandedNodeID(0, ua.ServiceTypeID(fault))
+		m.Service = fault
+		n, err = s.writeMessageChunks(ctx, instance, reqID, m, fault, writeChunk)
+	}
 	if err != nil {
 		event := "response_send_failure"
 		if timedOut {
