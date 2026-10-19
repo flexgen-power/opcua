@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	mrand "math/rand"
+	rdebug "runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -15,6 +16,37 @@ import (
 	"github.com/gopcua/opcua/uacp"
 	"github.com/gopcua/opcua/uasc"
 )
+
+// errorNotifyTimeout bounds how long closing a channel waits to tell a peer why.
+const errorNotifyTimeout = 2 * time.Second
+
+// closeWithError tells the peer why its connection is being closed, then
+// closes it. The notification is best effort: a peer that has stopped reading
+// blocks the write once the socket buffers are full, and a write deadline would
+// not help because a concurrent response write sets and clears its own. So a
+// timer closes the connection, which fails any write in progress whoever
+// started it, and the connection is closed either way.
+func closeWithError(conn *uacp.Conn, code ua.StatusCode, timeout time.Duration) {
+	watchdog := time.AfterFunc(timeout, func() { conn.Close() })
+	defer watchdog.Stop()
+	conn.SendError(code)
+	conn.Close()
+}
+
+// receive reads the next message from sc. A panic while decoding bytes from the
+// peer becomes an error that closes this channel; left alone it would take the
+// whole process, and every other client's data, down with it.
+func (c *channelBroker) receive(ctx context.Context, recv func(context.Context) *uasc.MessageBody) (msg *uasc.MessageBody) {
+	defer func() {
+		if r := recover(); r != nil {
+			if c.logger != nil {
+				c.logger.Error("recovered from a panic receiving on a secure channel: %v\n%s", r, rdebug.Stack())
+			}
+			msg = &uasc.MessageBody{Err: fmt.Errorf("panic receiving message: %v", r)}
+		}
+	}()
+	return recv(ctx)
+}
 
 type channelBroker struct {
 	endpoints map[string]*ua.EndpointDescription
@@ -170,7 +202,7 @@ outer:
 			break outer
 
 		default:
-			msg := sc.Receive(ctx)
+			msg := c.receive(ctx, sc.Receive)
 			if msg.Err == io.EOF {
 				closeCause = "eof"
 				conn.Close()
@@ -187,8 +219,7 @@ outer:
 				if errors.As(msg.Err, &status) {
 					code = status
 				}
-				conn.SendError(code)
-				conn.Close()
+				closeWithError(conn, code, errorNotifyTimeout)
 				sc.Close()
 				break outer
 			}
