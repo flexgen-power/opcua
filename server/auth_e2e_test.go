@@ -73,6 +73,7 @@ type secureServer struct {
 	srv      *server.Server
 	addr     string
 	node     *server.Node
+	ns       *server.NodeNameSpace
 	soc      atomic.Value // float64, read by the node's ValueFunc
 	authHits atomic.Int32
 }
@@ -107,6 +108,7 @@ func startSecureServer(t *testing.T, extra ...server.Option) *secureServer {
 	ss.srv = server.New(append(opts, extra...)...)
 
 	nodeNS := server.NewNodeNameSpace(ss.srv, "auth-test")
+	ss.ns = nodeNS
 	root, err := ss.srv.Namespace(0)
 	require.NoError(t, err)
 	root.Objects().AddRef(nodeNS.Objects(), id.HasComponent, true)
@@ -514,4 +516,73 @@ func TestRenewalCannotChangeSecurityProfile(t *testing.T) {
 				"server did not refuse the renewal with %s", tc.want)
 		})
 	}
+}
+
+// The client says, in its Hello, how large a chunk it can receive and how large
+// a response it will accept. A response that cannot fit gets a
+// Bad_ResponseTooLarge fault, not a stream of chunks the client has to reject.
+func TestResponsesHonourClientLimits(t *testing.T) {
+	ss := startSecureServer(t)
+	for i := 0; i < 600; i++ {
+		n := ss.ns.AddNewVariableStringNode(fmt.Sprintf("bulk_%03d", i), float64(i))
+		ss.ns.Objects().AddRef(n, id.HasComponent, true)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	defer cancel()
+
+	// A private ACK: the client's ack options write through to a package-wide
+	// default and would leak into every other test.
+	connect := func(t *testing.T, ack *uacp.Acknowledge) *opcua.Client {
+		c := secureClient(t, ctx, ss, ua.UserTokenTypeUserName,
+			opcua.AuthUsername(testUser, testPassword),
+			opcua.Dialer(&uacp.Dialer{Dialer: &net.Dialer{Timeout: 10 * time.Second}, ClientACK: ack}))
+		require.NoError(t, c.Connect(ctx))
+		t.Cleanup(func() { c.Close(ctx) })
+		return c
+	}
+	browse := func(c *opcua.Client) (*ua.BrowseResponse, error) {
+		return c.Browse(ctx, &ua.BrowseRequest{NodesToBrowse: []*ua.BrowseDescription{{
+			NodeID:          ss.ns.Objects().ID(),
+			BrowseDirection: ua.BrowseDirectionForward,
+			ReferenceTypeID: ua.NewNumericNodeID(0, id.HierarchicalReferences),
+			IncludeSubtypes: true,
+			ResultMask:      uint32(ua.BrowseResultMaskAll),
+		}}})
+	}
+	smallChunks := func(maxChunks, maxSize uint32) *uacp.Acknowledge {
+		return &uacp.Acknowledge{ReceiveBufSize: 8192, SendBufSize: 8192, MaxChunkCount: maxChunks, MaxMessageSize: maxSize}
+	}
+
+	t.Run("a small client buffer gets the response in chunks that fit it", func(t *testing.T) {
+		c := connect(t, smallChunks(0, 0))
+		resp, err := browse(c)
+		require.NoError(t, err)
+		require.Equal(t, ua.StatusOK, resp.Results[0].StatusCode)
+		require.GreaterOrEqual(t, len(resp.Results[0].References), 600)
+	})
+
+	t.Run("too many chunks gets a fault and the session lives on", func(t *testing.T) {
+		c := connect(t, smallChunks(2, 0))
+		_, err := browse(c)
+		requireStatus(t, err, ua.StatusBadResponseTooLarge)
+
+		// The fault used the response's own sequence number and nothing was
+		// half written, so the channel is intact.
+		resp, err := c.Read(ctx, &ua.ReadRequest{NodesToRead: []*ua.ReadValueID{{NodeID: ss.node.ID(), AttributeID: ua.AttributeIDValue}}})
+		require.NoError(t, err)
+		require.Equal(t, ua.StatusOK, resp.Results[0].Status)
+	})
+
+	t.Run("a message over the size limit gets a fault", func(t *testing.T) {
+		c := connect(t, smallChunks(0, 20000))
+		_, err := browse(c)
+		requireStatus(t, err, ua.StatusBadResponseTooLarge)
+	})
+
+	t.Run("a response within the limits is not refused", func(t *testing.T) {
+		c := connect(t, smallChunks(512, 16<<20))
+		resp, err := browse(c)
+		require.NoError(t, err)
+		require.GreaterOrEqual(t, len(resp.Results[0].References), 600)
+	})
 }
