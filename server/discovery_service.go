@@ -19,6 +19,13 @@ func (s *DiscoveryService) FindServers(sc *uasc.SecureChannel, r ua.Request, req
 	if s.srv.cfg.logger != nil {
 		s.srv.cfg.logger.Debug("Handling %T", r)
 	}
+	emitDiagInfo(s.srv.cfg.logger, diagPayload{
+		Event:           "find_servers_request",
+		ServiceType:     "FindServers",
+		RequestID:       reqID,
+		SecureChannelID: secureChannelID(sc),
+		RemoteAddr:      remoteAddr(sc),
+	})
 
 	req, err := safeReq[*ua.FindServersRequest](r)
 	if err != nil {
@@ -31,6 +38,13 @@ func (s *DiscoveryService) FindServers(sc *uasc.SecureChannel, r ua.Request, req
 			s.srv.Endpoints()[0].Server,
 		},
 	}
+	emitDiagInfo(s.srv.cfg.logger, diagPayload{
+		Event:           "find_servers_response",
+		ServiceType:     "FindServers",
+		RequestID:       reqID,
+		SecureChannelID: secureChannelID(sc),
+		RemoteAddr:      remoteAddr(sc),
+	})
 
 	return response, nil
 }
@@ -58,6 +72,14 @@ func (s *DiscoveryService) GetEndpoints(sc *uasc.SecureChannel, r ua.Request, re
 	if err != nil {
 		return nil, err
 	}
+	emitDiagInfo(s.srv.cfg.logger, diagPayload{
+		Event:           "get_endpoints_request",
+		ServiceType:     "GetEndpoints",
+		RequestID:       reqID,
+		SecureChannelID: secureChannelID(sc),
+		RemoteAddr:      remoteAddr(sc),
+		EndpointURL:     req.EndpointURL,
+	})
 
 	requrl := strings.ToLower(req.EndpointURL)
 	matching_endpoints := make([]*ua.EndpointDescription, 0)
@@ -72,6 +94,16 @@ func (s *DiscoveryService) GetEndpoints(sc *uasc.SecureChannel, r ua.Request, re
 		ResponseHeader: responseHeader(req.RequestHeader.RequestHandle, ua.StatusOK),
 		Endpoints:      matching_endpoints,
 	}
+	matchedCount := len(matching_endpoints)
+	emitDiagInfo(s.srv.cfg.logger, diagPayload{
+		Event:                "get_endpoints_response",
+		ServiceType:          "GetEndpoints",
+		RequestID:            reqID,
+		SecureChannelID:      secureChannelID(sc),
+		RemoteAddr:           remoteAddr(sc),
+		EndpointURL:          req.EndpointURL,
+		MatchedEndpointCount: &matchedCount,
+	})
 
 	return response, nil
 }

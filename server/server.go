@@ -67,7 +67,8 @@ type serverConfig struct {
 	enabledSec  []security
 	enabledAuth []authMode
 
-	cap ServerCapabilities
+	cap                  ServerCapabilities
+	responseWriteTimeout time.Duration
 
 	logger Logger
 }
@@ -99,11 +100,12 @@ type security struct {
 // Call Start() afterwards to begin listening and serving connections
 func New(opts ...Option) *Server {
 	cfg := &serverConfig{
-		cap:              capabilities,
-		applicationName:  "GOPCUA",               // override with the ServerName option
-		manufacturerName: "The gopcua Team",      // override with the ManufacturerName option
-		productName:      "gopcua OPC/UA Server", // override with the ProductName option
-		softwareVersion:  "0.0.0-dev",            // override with the SoftwareVersion option
+		cap:                  capabilities,
+		applicationName:      "GOPCUA",               // override with the ServerName option
+		manufacturerName:     "The gopcua Team",      // override with the ManufacturerName option
+		productName:          "gopcua OPC/UA Server", // override with the ProductName option
+		softwareVersion:      "0.0.0-dev",            // override with the SoftwareVersion option
+		responseWriteTimeout: 10 * time.Second,
 	}
 	for _, opt := range opts {
 		opt(cfg)
@@ -116,7 +118,7 @@ func New(opts ...Option) *Server {
 	s := &Server{
 		url:      url,
 		cfg:      cfg,
-		cb:       newChannelBroker(cfg.logger),
+		cb:       newChannelBroker(cfg.logger, cfg.responseWriteTimeout),
 		sb:       newSessionBroker(cfg.logger),
 		handlers: make(map[uint16]Handler),
 		namespaces: []NameSpace{
@@ -262,7 +264,7 @@ func (s *Server) Start(ctx context.Context) error {
 	s.setServerState(ua.ServerStateRunning)
 
 	if s.cb == nil {
-		s.cb = newChannelBroker(s.cfg.logger)
+		s.cb = newChannelBroker(s.cfg.logger, s.cfg.responseWriteTimeout)
 	}
 
 	go s.acceptAndRegister(ctx, s.l)
@@ -322,6 +324,10 @@ func (s *Server) acceptAndRegister(ctx context.Context, l *uacp.Listener) {
 				}
 			}
 
+			emitDiagInfo(s.cfg.logger, diagPayload{
+				Event:      "connection_registered",
+				RemoteAddr: c.RemoteAddr().String(),
+			})
 			go s.cb.RegisterConn(ctx, c, s.cfg.certificate, s.cfg.privateKey)
 			if s.cfg.logger != nil {
 				s.cfg.logger.Info("registered connection: %s", c.RemoteAddr())
@@ -339,6 +345,10 @@ func (s *Server) monitorConnections(ctx context.Context) {
 			continue // ctx is likely done, ctx.Err will be non-nil
 		}
 		if msg.Err != nil {
+			emitDiagWarn(s.cfg.logger, diagPayload{
+				Event:     "monitor_error",
+				ErrorText: msg.Err.Error(),
+			})
 			if s.cfg.logger != nil {
 				s.cfg.logger.Error("monitorConnections: Error received: %s\n", msg.Err)
 			}
@@ -358,8 +368,14 @@ func (s *Server) monitorConnections(ctx context.Context) {
 		s.cb.mu.RUnlock()
 		if !ok {
 			// if the secure channel ID is 0, this is probably a open secure channel request.
-			if s.cfg.logger != nil && msg.SecureChannelID != 0 {
-				s.cfg.logger.Error("monitorConnections: Unknown SecureChannel: %d", msg.SecureChannelID)
+			if msg.SecureChannelID != 0 {
+				emitDiagWarn(s.cfg.logger, diagPayload{
+					Event:           "unknown_secure_channel",
+					SecureChannelID: msg.SecureChannelID,
+				})
+				if s.cfg.logger != nil {
+					s.cfg.logger.Error("monitorConnections: Unknown SecureChannel: %d", msg.SecureChannelID)
+				}
 			}
 			continue
 		}

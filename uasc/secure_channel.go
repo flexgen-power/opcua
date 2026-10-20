@@ -9,6 +9,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"math"
 	"net"
@@ -240,6 +241,19 @@ func newSecureChannel(endpoint string, c *uacp.Conn, cfg *Config, kind channelKi
 
 func (s *SecureChannel) RemoteAddr() net.Addr {
 	return s.c.TCPConn.RemoteAddr()
+}
+
+func (s *SecureChannel) ID() uint32 {
+	s.instancesMu.Lock()
+	defer s.instancesMu.Unlock()
+
+	if s.activeInstance != nil {
+		return s.activeInstance.secureChannelID
+	}
+	if s.openingInstance != nil {
+		return s.openingInstance.secureChannelID
+	}
+	return 0
 }
 
 func (s *SecureChannel) getActiveChannelInstance() (*channelInstance, error) {
@@ -1059,7 +1073,7 @@ func (s *SecureChannel) sendAsyncWithTimeout(
 	return resp, nil
 }
 
-func (s *SecureChannel) writeMessageChunks(ctx context.Context, instance *channelInstance, reqID uint32, m *Message, body any) (int, error) {
+func (s *SecureChannel) writeMessageChunks(ctx context.Context, instance *channelInstance, reqID uint32, m *Message, body any, write func([]byte) (int, error)) (int, error) {
 	// Large service payloads may exceed a single UASC message body. Encode the
 	// full logical message up front, then stream each chunk in sequence while the
 	// caller holds the channel-instance lock.
@@ -1100,7 +1114,7 @@ func (s *SecureChannel) writeMessageChunks(ctx context.Context, instance *channe
 
 		// UASC writes are expected to flush complete chunks. Treat short writes as
 		// a hard error instead of silently truncating the response stream.
-		n, err := s.c.Write(chunk)
+		n, err := write(chunk)
 		if err != nil {
 			return bytesSent, err
 		}
@@ -1141,7 +1155,7 @@ func (s *SecureChannel) SendMsgWithContext(ctx context.Context, instance *channe
 	defer instance.Unlock()
 
 	m := instance.newMessage(resp, typeID, reqID)
-	if _, err := s.writeMessageChunks(ctx, instance, reqID, m, resp); err != nil {
+	if _, err := s.writeMessageChunks(ctx, instance, reqID, m, resp, s.c.Write); err != nil {
 		return err
 	}
 
@@ -1153,6 +1167,7 @@ func (s *SecureChannel) sendResponseWithContext(ctx context.Context, instance *c
 	if typeID == 0 {
 		return errors.Errorf("uasc: unknown service %T. Did you call register?", resp)
 	}
+	serviceType := fmt.Sprintf("%T", resp)
 
 	var err error
 	if instance == nil {
@@ -1165,11 +1180,93 @@ func (s *SecureChannel) sendResponseWithContext(ctx context.Context, instance *c
 	defer instance.Unlock()
 
 	m := instance.newMessage(resp, typeID, reqID)
-	if _, err := s.writeMessageChunks(ctx, instance, reqID, m, resp); err != nil {
+	emitDiagInfo(s.cfg.Logger, diagPayload{
+		Event:           "response_send_start",
+		ServiceType:     serviceType,
+		RequestID:       reqID,
+		SecureChannelID: instance.secureChannelID,
+	})
+
+	// Each chunk goes through writeResponse so the per-write deadline bounds a
+	// stalled client on every chunk, not only on single-chunk responses.
+	var timedOut bool
+	writeChunk := func(chunk []byte) (int, error) {
+		n, to, err := s.writeResponse(ctx, chunk)
+		timedOut = to
+		return n, err
+	}
+	n, err := s.writeMessageChunks(ctx, instance, reqID, m, resp, writeChunk)
+	if err != nil {
+		event := "response_send_failure"
+		if timedOut {
+			event = "response_send_timeout"
+		}
+		emitDiagWarn(s.cfg.Logger, diagPayload{
+			Event:           event,
+			ServiceType:     serviceType,
+			RequestID:       reqID,
+			SecureChannelID: instance.secureChannelID,
+			PayloadBytes:    n,
+			ErrorText:       err.Error(),
+		})
 		return err
 	}
 
+	emitDiagInfo(s.cfg.Logger, diagPayload{
+		Event:           "response_send_end",
+		ServiceType:     serviceType,
+		RequestID:       reqID,
+		SecureChannelID: instance.secureChannelID,
+		PayloadBytes:    n,
+	})
+
 	return nil
+}
+
+func (s *SecureChannel) writeResponse(ctx context.Context, payload []byte) (int, bool, error) {
+	select {
+	case <-ctx.Done():
+		return 0, false, ctx.Err()
+	default:
+	}
+
+	deadline, hasDeadline := responseWriteDeadline(ctx, s.cfg.ResponseWriteTimeout, time.Now())
+	if hasDeadline {
+		if err := s.c.SetWriteDeadline(deadline); err != nil {
+			_ = s.c.Close()
+			return 0, false, err
+		}
+	}
+
+	n, err := s.c.Write(payload)
+	if err != nil {
+		_ = s.c.Close()
+		var netErr net.Error
+		return n, errors.As(err, &netErr) && netErr.Timeout(), err
+	}
+	if n != len(payload) {
+		err = errors.Errorf("uasc: incomplete response sent len=%d sent=%d", len(payload), n)
+		_ = s.c.Close()
+		return n, false, err
+	}
+	if hasDeadline {
+		if err := s.c.SetWriteDeadline(time.Time{}); err != nil {
+			_ = s.c.Close()
+			return n, false, err
+		}
+	}
+	return n, false, nil
+}
+
+func responseWriteDeadline(ctx context.Context, timeout time.Duration, now time.Time) (time.Time, bool) {
+	var deadline time.Time
+	if timeout > 0 {
+		deadline = now.Add(timeout)
+	}
+	if contextDeadline, ok := ctx.Deadline(); ok && (deadline.IsZero() || contextDeadline.Before(deadline)) {
+		deadline = contextDeadline
+	}
+	return deadline, !deadline.IsZero()
 }
 
 func (s *SecureChannel) nextRequestID() uint32 {

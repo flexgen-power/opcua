@@ -31,19 +31,21 @@ type channelBroker struct {
 
 	// msgChan is the common channel that all messages from all channels
 	// get funneled into for handling
-	msgChan chan *uasc.MessageBody
-	logger  Logger
+	msgChan              chan *uasc.MessageBody
+	logger               Logger
+	responseWriteTimeout time.Duration
 }
 
-func newChannelBroker(logger Logger) *channelBroker {
+func newChannelBroker(logger Logger, responseWriteTimeout time.Duration) *channelBroker {
 	rng := mrand.New(mrand.NewSource(time.Now().UnixNano()))
 	return &channelBroker{
-		endpoints:       make(map[string]*ua.EndpointDescription),
-		s:               make(map[uint32]*uasc.SecureChannel),
-		msgChan:         make(chan *uasc.MessageBody),
-		secureChannelID: uint32(rng.Int31()),
-		secureTokenID:   uint32(rng.Int31()),
-		logger:          logger,
+		endpoints:            make(map[string]*ua.EndpointDescription),
+		s:                    make(map[uint32]*uasc.SecureChannel),
+		msgChan:              make(chan *uasc.MessageBody),
+		secureChannelID:      uint32(rng.Int31()),
+		secureTokenID:        uint32(rng.Int31()),
+		logger:               logger,
+		responseWriteTimeout: responseWriteTimeout,
 	}
 }
 
@@ -55,6 +57,8 @@ func (c *channelBroker) RegisterConn(ctx context.Context, conn *uacp.Conn, local
 	cfg := defaultChannelConfig()
 	cfg.Certificate = localCert
 	cfg.LocalKey = localKey
+	cfg.Logger = c.logger
+	cfg.ResponseWriteTimeout = c.responseWriteTimeout
 
 	c.mu.Lock()
 	c.secureChannelID++
@@ -83,32 +87,37 @@ func (c *channelBroker) RegisterConn(ctx context.Context, conn *uacp.Conn, local
 
 	c.mu.Lock()
 	c.s[secureChannelID] = sc
-	if c.logger != nil {
-		c.logger.Info("Registered new channel (id %d) now at %d channels", secureChannelID, len(c.s))
-	}
-	c.mu.Unlock()
+	channelCount := len(c.s)
 	c.wg.Add(1)
+	c.mu.Unlock()
+	defer c.wg.Done()
+	// Logger callbacks are external code and must not run under the broker lock.
+	emitDiagInfo(c.logger, diagPayload{
+		Event:           "channel_registered",
+		SecureChannelID: secureChannelID,
+		ChannelCount:    &channelCount,
+	})
+	if c.logger != nil {
+		c.logger.Info("Registered new channel (id %d) now at %d channels", secureChannelID, channelCount)
+	}
+	closeCause := "context_done"
+	var closeErr string
 outer:
 	for {
 		select {
 		case <-ctx.Done():
 			// todo(fs): return error?
-			if c.logger != nil {
-				c.logger.Warn("Context done, closing Secure Channel %d", secureChannelID)
-			}
+			closeCause = "context_done"
 			break outer
 
 		default:
 			msg := sc.Receive(ctx)
 			if msg.Err == io.EOF {
-				if c.logger != nil {
-					c.logger.Warn("Secure Channel %d closed", secureChannelID)
-				}
+				closeCause = "eof"
 				break outer
 			} else if msg.Err != nil {
-				if c.logger != nil {
-					c.logger.Error("Secure Channel %d error: %s", secureChannelID, msg.Err)
-				}
+				closeCause = "error"
+				closeErr = msg.Err.Error()
 				break outer
 			}
 			// todo(fs): honor ctx
@@ -118,9 +127,25 @@ outer:
 
 	c.mu.Lock()
 	delete(c.s, secureChannelID)
+	remainingChannels := len(c.s)
 	c.mu.Unlock()
-	c.wg.Done()
-
+	emitDiagInfo(c.logger, diagPayload{
+		Event:           "channel_closed",
+		SecureChannelID: secureChannelID,
+		CloseCause:      closeCause,
+		ErrorText:       closeErr,
+		ChannelCount:    &remainingChannels,
+	})
+	if c.logger != nil {
+		switch closeCause {
+		case "context_done":
+			c.logger.Warn("Context done, closing Secure Channel %d", secureChannelID)
+		case "eof":
+			c.logger.Warn("Secure Channel %d closed", secureChannelID)
+		default:
+			c.logger.Error("Secure Channel %d error: %s", secureChannelID, closeErr)
+		}
+	}
 	return nil
 }
 

@@ -13,6 +13,7 @@ import (
 
 // Config represents a configuration which UASC client/server has in common.
 type Config struct {
+	Logger Logger
 
 	// SecurityPolicyURI is the URI of the Security Policy used to secure the Message.
 	// This field is encoded as a UTF-8 string without a null terminator.
@@ -80,6 +81,10 @@ type Config struct {
 	// RequestTimeout is timeout duration for all synchronous requests over SecureChannel.
 	// If the Server doesn't respond within RequestTimeout time, Client returns StatusBadTimeout
 	RequestTimeout time.Duration
+
+	// ResponseWriteTimeout bounds server-side response writes. A non-positive
+	// value disables this timeout unless the supplied context has a deadline.
+	ResponseWriteTimeout time.Duration
 }
 
 // SessionConfig is a set of common configurations used in Session.

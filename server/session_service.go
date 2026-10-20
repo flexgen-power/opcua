@@ -35,6 +35,14 @@ func (s *SessionService) CreateSession(sc *uasc.SecureChannel, r ua.Request, req
 	if err != nil {
 		return nil, err
 	}
+	emitDiagInfo(s.srv.cfg.logger, diagPayload{
+		Event:           "create_session_request",
+		ServiceType:     "CreateSession",
+		RequestID:       reqID,
+		SecureChannelID: secureChannelID(sc),
+		RemoteAddr:      remoteAddr(sc),
+		EndpointURL:     req.EndpointURL,
+	})
 
 	// New session
 	sess := s.srv.sb.NewSession()
@@ -83,6 +91,16 @@ func (s *SessionService) CreateSession(sc *uasc.SecureChannel, r ua.Request, req
 		ServerNonce:       nonce,
 		ServerEndpoints:   matching_endpoints,
 	}
+	matchedCount := len(matching_endpoints)
+	emitDiagInfo(s.srv.cfg.logger, diagPayload{
+		Event:                "create_session_response",
+		ServiceType:          "CreateSession",
+		RequestID:            reqID,
+		SecureChannelID:      secureChannelID(sc),
+		RemoteAddr:           remoteAddr(sc),
+		EndpointURL:          req.EndpointURL,
+		MatchedEndpointCount: &matchedCount,
+	})
 
 	return response, nil
 }
