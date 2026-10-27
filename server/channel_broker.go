@@ -3,9 +3,11 @@ package server
 import (
 	"context"
 	"crypto/rsa"
+	"errors"
 	"fmt"
 	"io"
 	mrand "math/rand"
+	rdebug "runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,6 +16,37 @@ import (
 	"github.com/gopcua/opcua/uacp"
 	"github.com/gopcua/opcua/uasc"
 )
+
+// errorNotifyTimeout bounds how long closing a channel waits to tell a peer why.
+const errorNotifyTimeout = 2 * time.Second
+
+// closeWithError tells the peer why its connection is being closed, then
+// closes it. The notification is best effort: a peer that has stopped reading
+// blocks the write once the socket buffers are full, and a write deadline would
+// not help because a concurrent response write sets and clears its own. So a
+// timer closes the connection, which fails any write in progress whoever
+// started it, and the connection is closed either way.
+func closeWithError(conn *uacp.Conn, code ua.StatusCode, timeout time.Duration) {
+	watchdog := time.AfterFunc(timeout, func() { conn.Close() })
+	defer watchdog.Stop()
+	conn.SendError(code)
+	conn.Close()
+}
+
+// receive reads the next message from sc. A panic while decoding bytes from the
+// peer becomes an error that closes this channel; left alone it would take the
+// whole process, and every other client's data, down with it.
+func (c *channelBroker) receive(ctx context.Context, recv func(context.Context) *uasc.MessageBody) (msg *uasc.MessageBody) {
+	defer func() {
+		if r := recover(); r != nil {
+			if c.logger != nil {
+				c.logger.Error("recovered from a panic receiving on a secure channel: %v\n%s", r, rdebug.Stack())
+			}
+			msg = &uasc.MessageBody{Err: fmt.Errorf("panic receiving message: %v", r)}
+		}
+	}()
+	return recv(ctx)
+}
 
 type channelBroker struct {
 	endpoints map[string]*ua.EndpointDescription
@@ -36,6 +69,8 @@ type channelBroker struct {
 	msgChan              chan *uasc.MessageBody
 	logger               Logger
 	responseWriteTimeout time.Duration
+	// certValidator vets a client application certificate on OpenSecureChannel.
+	certValidator func(cert []byte) error
 
 	// dispatchTimeout is how long a reader waits to hand off a message while
 	// the dispatcher accepts nothing at all; non-positive disables it.
@@ -114,6 +149,7 @@ func (c *channelBroker) RegisterConn(ctx context.Context, conn *uacp.Conn, local
 	cfg.LocalKey = localKey
 	cfg.Logger = c.logger
 	cfg.ResponseWriteTimeout = c.responseWriteTimeout
+	cfg.RemoteCertificateValidator = c.certValidator
 
 	c.mu.Lock()
 	c.secureChannelID++
@@ -166,13 +202,25 @@ outer:
 			break outer
 
 		default:
-			msg := sc.Receive(ctx)
+			msg := c.receive(ctx, sc.Receive)
 			if msg.Err == io.EOF {
 				closeCause = "eof"
+				conn.Close()
+				sc.Close()
 				break outer
 			} else if msg.Err != nil {
 				closeCause = "error"
 				closeErr = msg.Err.Error()
+				// Nothing reads this channel after the loop exits, so leaving
+				// the socket open strands the client until its own timeout.
+				// Tell it why, then close (Part 6, 7.1.2.4 / 7.1.3).
+				code := ua.StatusBadSecureChannelClosed
+				var status ua.StatusCode
+				if errors.As(msg.Err, &status) {
+					code = status
+				}
+				closeWithError(conn, code, errorNotifyTimeout)
+				sc.Close()
 				break outer
 			}
 			if cause := c.dispatch(ctx, msg); cause != "" {

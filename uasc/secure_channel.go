@@ -127,6 +127,10 @@ type SecureChannel struct {
 	activeInstance *channelInstance
 	instancesMu    sync.Mutex
 
+	// peer is the security profile a server channel was opened with, published
+	// whole for readers on other goroutines. See PeerSecurity.
+	peer atomic.Pointer[PeerSecurity]
+
 	// prevent sending msg when secure channel renewal occurs
 	reqLocker  *conditionLocker
 	rcvLocker  *conditionLocker
@@ -488,17 +492,42 @@ func (s *SecureChannel) readChunk() (*MessageChunk, error) {
 			return nil, errors.Errorf("sechan: invalid state. openingInstance is nil.")
 		}
 
-		s.cfg.SecurityPolicyURI = m.SecurityPolicyURI
-		if m.SecurityPolicyURI != ua.SecurityPolicyURINone {
-			s.cfg.RemoteCertificate = m.AsymmetricSecurityHeader.SenderCertificate
-			// Re-derive the receiver thumbprint from the peer certificate
-			// learned in the inbound OPN. No-op for the client path, where
-			// Thumbprint is already set from the endpoint's ServerCertificate
-			// at session open.
-			if len(s.cfg.RemoteCertificate) > 0 {
-				s.cfg.Thumbprint = uapolicy.Thumbprint(s.cfg.RemoteCertificate)
+		// On a server channel that is already open this OPN is a renewal. It
+		// may not change the policy or the peer certificate, and so it changes
+		// nothing on the channel's configuration: the fields are written once,
+		// by the OPN that opens the channel, and other goroutines read them.
+		renewal := s.kind == server && s.established()
+		if renewal {
+			if err := s.checkRenewalPolicy(m.SecurityPolicyURI, m.AsymmetricSecurityHeader.SenderCertificate); err != nil {
+				debug.Printf("uasc %d: refused renewal: %s", s.c.ID(), err)
+				return nil, err
 			}
-			debug.Printf("uasc %d: setting securityPolicy to %s", s.c.ID(), m.SecurityPolicyURI)
+		} else {
+			s.cfg.SecurityPolicyURI = m.SecurityPolicyURI
+		}
+		decryptWith = s.openingInstance
+		if m.SecurityPolicyURI != ua.SecurityPolicyURINone {
+			if !renewal {
+				if v := s.cfg.RemoteCertificateValidator; v != nil {
+					if err := v(m.AsymmetricSecurityHeader.SenderCertificate); err != nil {
+						debug.Printf("uasc %d: rejected peer certificate: %s", s.c.ID(), err)
+						var code ua.StatusCode
+						if errors.As(err, &code) {
+							return nil, code
+						}
+						return nil, ua.StatusBadSecurityChecksFailed
+					}
+				}
+				s.cfg.RemoteCertificate = m.AsymmetricSecurityHeader.SenderCertificate
+				// Re-derive the receiver thumbprint from the peer certificate
+				// learned in the inbound OPN. No-op for the client path, where
+				// Thumbprint is already set from the endpoint's ServerCertificate
+				// at session open.
+				if len(s.cfg.RemoteCertificate) > 0 {
+					s.cfg.Thumbprint = uapolicy.Thumbprint(s.cfg.RemoteCertificate)
+				}
+				debug.Printf("uasc %d: setting securityPolicy to %s", s.c.ID(), m.SecurityPolicyURI)
+			}
 
 			remoteCert, err := uapolicy.ParseCertificate(s.cfg.RemoteCertificate)
 			if err != nil {
@@ -513,10 +542,17 @@ func (s *SecureChannel) readChunk() (*MessageChunk, error) {
 				return nil, err
 			}
 
-			s.openingInstance.algo = algo
+			if renewal {
+				// The live instance is still carrying traffic with its
+				// symmetric keys. Decrypt the renewal with a throwaway
+				// instance instead of swapping the algorithm under it.
+				tmp := newChannelInstance(s)
+				tmp.algo = algo
+				decryptWith = tmp
+			} else {
+				s.openingInstance.algo = algo
+			}
 		}
-
-		decryptWith = s.openingInstance
 	case "CLO":
 		return nil, io.EOF
 	case "MSG":
@@ -760,8 +796,20 @@ func (s *SecureChannel) handleOpenSecureChannelRequest(reqID uint32, svc ua.Requ
 		return ua.StatusBadSecureChannelTokenUnknown
 	}
 
+	// A renewal of an open channel keeps its security profile. Refuse a
+	// request for another mode before anything is changed, since the channel
+	// ID alone does not carry what ActivateSession checked against it.
+	renewal := s.established()
+	if renewal {
+		if err := s.checkRenewalMode(req); err != nil {
+			return err
+		}
+	}
+
 	s.cfg.Lifetime = req.RequestedLifetime
-	s.cfg.SecurityMode = req.SecurityMode
+	if !renewal {
+		s.cfg.SecurityMode = req.SecurityMode
+	}
 
 	// I had to do the encryption setup in the chunk decoding logic because you have to
 	// decrypt the thing before you even know you have an open message.
@@ -822,24 +870,48 @@ func (s *SecureChannel) handleOpenSecureChannelRequest(reqID uint32, svc ua.Requ
 	}
 
 	ctx := context.Background() // todo(fs): fixme
-	if err := s.sendResponseWithContext(ctx, instance, reqID, resp); err != nil {
-		return err
-	}
 
-	instance.algo, err = uapolicy.Symmetric(s.cfg.SecurityPolicyURI, nonce, req.ClientNonce)
+	// The reply is signed with the asymmetric algorithm and the new symmetric
+	// keys are installed right after it. On a renewal this instance is the
+	// live one, and senders on other goroutines use its algorithm with the
+	// instance locked, so the whole switch happens under that lock: no send
+	// can see the asymmetric algorithm, or keys that are half replaced.
+	instance.Lock()
+	prev := instance.algo
+	instance.algo = algo
+	err = s.sendResponseLocked(ctx, instance, reqID, resp)
+	if err == nil {
+		var sym *uapolicy.EncryptionAlgorithm
+		if sym, err = uapolicy.Symmetric(s.cfg.SecurityPolicyURI, nonce, req.ClientNonce); err == nil {
+			instance.algo = sym
+			instance.SetMaximumBodySize(int(s.c.SendBufSize()))
+			instance.state = channelActive // todo(fs): is this correct?
+			// s.setState(secureChannelOpen)
+		}
+	}
+	if err != nil {
+		instance.algo = prev
+	}
+	instance.Unlock()
 	if err != nil {
 		return err
 	}
-	instance.SetMaximumBodySize(int(s.c.SendBufSize()))
 
-	instance.state = channelActive // todo(fs): is this correct?
-	// s.setState(secureChannelOpen)
+	if !renewal {
+		s.peer.Store(&PeerSecurity{
+			PolicyURI:   s.cfg.SecurityPolicyURI,
+			Mode:        s.cfg.SecurityMode,
+			Certificate: s.cfg.RemoteCertificate,
+		})
+	}
 
 	s.instancesMu.Lock()
-	s.instances[instance.secureChannelID] = append(
-		s.instances[instance.secureChannelID],
-		instance,
-	)
+	if !renewal {
+		s.instances[instance.secureChannelID] = append(
+			s.instances[instance.secureChannelID],
+			instance,
+		)
+	}
 	s.activeInstance = instance
 	s.instancesMu.Unlock()
 
@@ -1077,14 +1149,17 @@ func (s *SecureChannel) writeMessageChunks(ctx context.Context, instance *channe
 	// Large service payloads may exceed a single UASC message body. Encode the
 	// full logical message up front, then stream each chunk in sequence while the
 	// caller holds the channel-instance lock.
-	//
-	// TODO: enforce the negotiated MaxMessageSize / MaxChunkCount here and abort
-	// with Bad_ResponseTooLarge instead of writing an over-limit chunk stream.
-	// These limits are already enforced on the receive path (see the chunk-count
-	// and message-size checks in Receive) but not on send (OPC UA Part 6 §6.7.2;
-	// cf. open62541 adjustCheckMessageLimitsSym, .NET MessageLimitsExceeded).
 	chunks, err := m.EncodeChunks(instance.maxBodySize)
 	if err != nil {
+		return 0, err
+	}
+
+	// The client said how many chunks and bytes a response may have. Check
+	// before anything is signed or written, so a response that cannot fit
+	// leaves the channel and its sequence numbers untouched and the caller can
+	// answer with a fault instead (Part 6, 6.7.2; cf. open62541
+	// adjustCheckMessageLimitsSym, .NET MessageLimitsExceeded).
+	if err := s.checkPeerLimits(instance, chunks); err != nil {
 		return 0, err
 	}
 
@@ -1162,12 +1237,51 @@ func (s *SecureChannel) SendMsgWithContext(ctx context.Context, instance *channe
 	return nil
 }
 
+// checkPeerLimits returns BadResponseTooLarge if the encoded chunks exceed the
+// chunk count or message size the client set in its Hello. Signing and
+// encryption add up to a signature and one cipher block to each chunk, which
+// the size check allows for so it never under-counts.
+func (s *SecureChannel) checkPeerLimits(instance *channelInstance, chunks [][]byte) error {
+	if maxChunks := s.c.PeerMaxChunkCount(); maxChunks > 0 && uint64(len(chunks)) > uint64(maxChunks) {
+		return ua.StatusBadResponseTooLarge
+	}
+	if maxSize := s.c.PeerMaxMessageSize(); maxSize > 0 {
+		overhead := 0
+		if instance.algo != nil {
+			overhead = instance.algo.SignatureLength() + instance.algo.BlockSize()
+		}
+		var total uint64
+		for _, c := range chunks {
+			total += uint64(len(c) + overhead)
+		}
+		if total > uint64(maxSize) {
+			return ua.StatusBadResponseTooLarge
+		}
+	}
+	return nil
+}
+
+// tooLargeFault is what a client gets when its response does not fit within
+// the limits it set.
+func (s *SecureChannel) tooLargeFault(resp ua.Response) *ua.ServiceFault {
+	var handle uint32
+	if h := resp.Header(); h != nil {
+		handle = h.RequestHandle
+	}
+	return &ua.ServiceFault{ResponseHeader: &ua.ResponseHeader{
+		Timestamp:          s.timeNow(),
+		RequestHandle:      handle,
+		ServiceResult:      ua.StatusBadResponseTooLarge,
+		ServiceDiagnostics: &ua.DiagnosticInfo{},
+		StringTable:        []string{},
+		AdditionalHeader:   ua.NewExtensionObject(nil),
+	}}
+}
+
 func (s *SecureChannel) sendResponseWithContext(ctx context.Context, instance *channelInstance, reqID uint32, resp ua.Response) error {
-	typeID := ua.ServiceTypeID(resp)
-	if typeID == 0 {
+	if ua.ServiceTypeID(resp) == 0 {
 		return errors.Errorf("uasc: unknown service %T. Did you call register?", resp)
 	}
-	serviceType := fmt.Sprintf("%T", resp)
 
 	var err error
 	if instance == nil {
@@ -1178,6 +1292,16 @@ func (s *SecureChannel) sendResponseWithContext(ctx context.Context, instance *c
 	}
 	instance.Lock()
 	defer instance.Unlock()
+	return s.sendResponseLocked(ctx, instance, reqID, resp)
+}
+
+// sendResponseLocked sends resp on instance, whose lock the caller holds.
+func (s *SecureChannel) sendResponseLocked(ctx context.Context, instance *channelInstance, reqID uint32, resp ua.Response) error {
+	typeID := ua.ServiceTypeID(resp)
+	if typeID == 0 {
+		return errors.Errorf("uasc: unknown service %T. Did you call register?", resp)
+	}
+	serviceType := fmt.Sprintf("%T", resp)
 
 	m := instance.newMessage(resp, typeID, reqID)
 	emitDiagInfo(s.cfg.Logger, diagPayload{
@@ -1196,6 +1320,21 @@ func (s *SecureChannel) sendResponseWithContext(ctx context.Context, instance *c
 		return n, err
 	}
 	n, err := s.writeMessageChunks(ctx, instance, reqID, m, resp, writeChunk)
+	if code, ok := err.(ua.StatusCode); ok && code == ua.StatusBadResponseTooLarge {
+		// Nothing was written, so the message's sequence number is still
+		// unused: send the fault under it rather than leaving a gap.
+		emitDiagWarn(s.cfg.Logger, diagPayload{
+			Event:           "response_too_large",
+			ServiceType:     serviceType,
+			RequestID:       reqID,
+			SecureChannelID: instance.secureChannelID,
+			ErrorText:       "response exceeds the chunk count or message size the client accepts",
+		})
+		fault := s.tooLargeFault(resp)
+		m.TypeID = ua.NewFourByteExpandedNodeID(0, ua.ServiceTypeID(fault))
+		m.Service = fault
+		n, err = s.writeMessageChunks(ctx, instance, reqID, m, fault, writeChunk)
+	}
 	if err != nil {
 		event := "response_send_failure"
 		if timedOut {
