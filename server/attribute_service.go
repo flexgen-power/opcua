@@ -40,8 +40,7 @@ func (s *AttributeService) Read(sc *uasc.SecureChannel, r ua.Request, reqID uint
 			}
 			continue
 		}
-		results[i] = ns.Attribute(n.NodeID, n.AttributeID)
-
+		results[i] = applyIndexRange(ns.Attribute(n.NodeID, n.AttributeID), n.IndexRange)
 	}
 
 	response := &ua.ReadResponse{

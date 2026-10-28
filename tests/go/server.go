@@ -73,6 +73,13 @@ func startServer() *server.Server {
 	n = nodeNS.AddNewVariableStringNode("rw_int32", int32(5))
 	nns_obj.AddRef(n, id.HasComponent, true)
 
+	// A packed cell array, read per element with IndexRange in index_range_test.go.
+	n = nodeNS.AddNewVariableStringNode("ro_array_uint16", []uint16{3300, 3301, 3302, 3303, 3304})
+	n.SetAttribute(ua.AttributeIDUserAccessLevel, server.DataValueFromValue(
+		byte(ua.AccessLevelTypeCurrentRead),
+	))
+	nns_obj.AddRef(n, id.HasComponent, true)
+
 	var3 := server.NewNode(
 		ua.NewStringNodeID(nodeNS.ID(), "NoPermVariable"), // you can use whatever node id you want here, whether it's numeric, string, guid, etc...
 		map[ua.AttributeID]*ua.DataValue{
