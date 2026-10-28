@@ -132,6 +132,7 @@ type pendingNotification struct {
 	clientHandle uint32
 	node         *ua.NodeID
 	attributeID  ua.AttributeID
+	indexRange   string
 	ns           namespaceLookup
 }
 
@@ -205,7 +206,7 @@ func (s *MonitoredItemService) deliver(p pendingNotification) {
 		val.Value.Status = ua.StatusBad
 		val.Value.EncodingMask |= ua.DataValueStatusCode
 	} else {
-		val.Value = p.ns.ns.Attribute(p.node, p.attributeID)
+		val.Value = applyIndexRange(p.ns.ns.Attribute(p.node, p.attributeID), p.indexRange)
 	}
 
 	p.sub.Notify(val)
@@ -238,6 +239,7 @@ func (s *MonitoredItemService) collectNotifications(nodes []*ua.NodeID, lookups 
 				clientHandle: item.Req.RequestedParameters.ClientHandle,
 				node:         n,
 				attributeID:  item.Req.ItemToMonitor.AttributeID,
+				indexRange:   item.Req.ItemToMonitor.IndexRange,
 				ns:           lookups[n.Namespace()],
 			})
 		}
@@ -306,6 +308,15 @@ func (s *MonitoredItemService) CreateMonitoredItems(sc *uasc.SecureChannel, r ua
 	for i := range req.ItemsToCreate {
 		itemreq := req.ItemsToCreate[i]
 		nodeid := itemreq.ItemToMonitor.NodeID
+		// Part 4 §5.13.2.4: a malformed IndexRange fails this item only. The item
+		// is not registered, so no notifications are ever produced for it.
+		if _, _, status := parseIndexRange(itemreq.ItemToMonitor.IndexRange); status != ua.StatusOK {
+			res[i] = &ua.MonitoredItemCreateResult{
+				StatusCode:   status,
+				FilterResult: ua.NewExtensionObject(nil),
+			}
+			continue
+		}
 		item := MonitoredItem{
 			ID:  s.NextID(),
 			Sub: sub,
