@@ -1,0 +1,37 @@
+diff --git a/uasc/secure_channel_crypto.go b/uasc/secure_channel_crypto.go
+index a18fb76..6495624 100644
+--- a/uasc/secure_channel_crypto.go
++++ b/uasc/secure_channel_crypto.go
+@@ -5,6 +5,7 @@
+ package uasc
+ 
+ import (
++	"bytes"
+ 	"crypto/rsa"
+ 	"encoding/binary"
+ 
+@@ -54,12 +55,19 @@ func (s *SecureChannel) VerifySessionSignature(cert, nonce, signature []byte) er
+ 	if err != nil {
+ 		return err
+ 	}
+-	err = enc.VerifySignature(append(s.cfg.Certificate, nonce...), signature)
+-	if err != nil {
+-		return err
++	// The client signs our certificate followed by the nonce. When we present
++	// a chain, the signature covers the leaf only (Part 4, 5.6.3.2). Clients
++	// that sign the whole blob, as this package's own client does, are still
++	// accepted.
++	leaf := s.cfg.Certificate
++	if c, perr := uapolicy.ParseCertificate(s.cfg.Certificate); perr == nil {
++		leaf = c.Raw
+ 	}
+-
+-	return nil
++	err = enc.VerifySignature(append(bytes.Clone(leaf), nonce...), signature)
++	if err != nil && len(leaf) != len(s.cfg.Certificate) {
++		err = enc.VerifySignature(append(bytes.Clone(s.cfg.Certificate), nonce...), signature)
++	}
++	return err
+ }
+ 
+ // EncryptUserPassword issues a new signature for the client to send in ActivateSessionRequest
