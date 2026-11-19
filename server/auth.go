@@ -46,8 +46,9 @@ type UserIdentity struct {
 
 // Authenticator decides whether an identity may activate a session. It runs
 // on the server's request dispatcher, so it should return quickly. Returning
-// nil accepts. A returned ua.StatusCode is sent to the client as is; any other
-// error is sent as BadUserAccessDenied.
+// nil accepts; any non-nil error refuses. A returned Bad ua.StatusCode is sent
+// to the client as is; any other error, including a Good or Uncertain status
+// code, is sent as BadUserAccessDenied.
 type Authenticator func(UserIdentity) error
 
 // SetAuthenticator installs the decision function for UserName and Certificate
@@ -168,8 +169,10 @@ func (s *SessionService) authenticateIdentity(sc *uasc.SecureChannel, sess *sess
 	}
 
 	if err := s.srv.cfg.authenticator(id); err != nil {
+		// Only a Bad code is a refusal the client can be told as is. Anything
+		// else, including StatusOK returned as an error, still refuses.
 		var code ua.StatusCode
-		if errors.As(err, &code) {
+		if errors.As(err, &code) && code&ua.StatusBad != 0 {
 			return identityResult{}, code
 		}
 		return identityResult{}, ua.StatusBadUserAccessDenied
