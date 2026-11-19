@@ -7,6 +7,7 @@ package server
 import (
 	"context"
 	"fmt"
+	rdebug "runtime/debug"
 	"time"
 
 	"github.com/gopcua/opcua/id"
@@ -127,7 +128,7 @@ func (s *Server) handleService(ctx context.Context, sc *uasc.SecureChannel, reqI
 		if code := s.checkSession(sc, typeID, req); code != ua.StatusOK {
 			err = code
 		} else {
-			resp, err = h(sc, req, reqID)
+			resp, err = s.callHandler(h, sc, req, reqID)
 		}
 	} else {
 		if typeID == 0 {
@@ -165,11 +166,13 @@ func (s *Server) handleService(ctx context.Context, sc *uasc.SecureChannel, reqI
 	}
 
 	if err != nil {
-		if statusCode, ok := err.(ua.StatusCode); ok {
-			resp = &ua.ServiceFault{ResponseHeader: responseHeader(0, statusCode)}
-		} else {
-			resp = &ua.ServiceFault{ResponseHeader: responseHeader(0, ua.StatusBadUnexpectedError)}
+		// The fault echoes the request's handle, so a client that matches
+		// responses on it sees the refusal rather than a mismatched response.
+		statusCode, ok := err.(ua.StatusCode)
+		if !ok {
+			statusCode = ua.StatusBadUnexpectedError
 		}
+		resp = &ua.ServiceFault{ResponseHeader: responseHeader(requestHandle(req), statusCode)}
 	}
 
 	if resp == nil {
@@ -236,6 +239,32 @@ func (s *Server) checkSession(sc *uasc.SecureChannel, typeID uint16, req ua.Requ
 		return ua.StatusBadSecureChannelIDInvalid
 	}
 	return ua.StatusOK
+}
+
+// callHandler runs a service handler. The dispatcher is one goroutine for the
+// whole server, so a panic in a handler becomes a fault for that request
+// instead of ending the process.
+func (s *Server) callHandler(h Handler, sc *uasc.SecureChannel, req ua.Request, reqID uint32) (resp ua.Response, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			if s.cfg.logger != nil {
+				s.cfg.logger.Error("recovered from a panic handling %T: %v\n%s", req, r, rdebug.Stack())
+			}
+			resp, err = nil, ua.StatusBadInternalError
+		}
+	}()
+	return h(sc, req, reqID)
+}
+
+// requestHandle is the client's handle for req, or 0 if it has no header.
+func requestHandle(req ua.Request) uint32 {
+	if req == nil {
+		return 0
+	}
+	if h := req.Header(); h != nil {
+		return h.RequestHandle
+	}
+	return 0
 }
 
 func responseHeader(reqID uint32, statusCode ua.StatusCode) *ua.ResponseHeader {
