@@ -14,9 +14,13 @@ import (
 func TestBrowse(t *testing.T) {
 	ctx := context.Background()
 
-	// start the server
+	// start the server. Anonymous access over None has to be enabled
+	// explicitly: a server with no endpoints configured accepts no identity
+	// token (it fails closed).
 	s := server.New(
 		server.EndPoint("localhost", 4840),
+		server.EnableSecurity("None", ua.MessageSecurityModeNone),
+		server.EnableAuthMode(ua.UserTokenTypeAnonymous),
 	)
 	populateServer(s)
 	if err := s.Start(ctx); err != nil {

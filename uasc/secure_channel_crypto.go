@@ -5,7 +5,7 @@
 package uasc
 
 import (
-	"crypto/rsa"
+	"bytes"
 	"encoding/binary"
 
 	"github.com/gopcua/opcua/ua"
@@ -18,11 +18,10 @@ func (s *SecureChannel) NewSessionSignature(cert, nonce []byte) ([]byte, string,
 		return nil, "", nil
 	}
 
-	remoteX509Cert, err := uapolicy.ParseCertificate(cert)
+	remoteKey, err := uapolicy.PublicKey(cert)
 	if err != nil {
 		return nil, "", err
 	}
-	remoteKey := remoteX509Cert.PublicKey.(*rsa.PublicKey)
 
 	enc, err := uapolicy.Asymmetric(s.cfg.SecurityPolicyURI, s.cfg.LocalKey, remoteKey)
 	if err != nil {
@@ -44,22 +43,28 @@ func (s *SecureChannel) VerifySessionSignature(cert, nonce, signature []byte) er
 		return nil
 	}
 
-	remoteX509Cert, err := uapolicy.ParseCertificate(cert)
+	remoteKey, err := uapolicy.PublicKey(cert)
 	if err != nil {
 		return err
 	}
-	remoteKey := remoteX509Cert.PublicKey.(*rsa.PublicKey)
 
 	enc, err := uapolicy.Asymmetric(s.cfg.SecurityPolicyURI, s.cfg.LocalKey, remoteKey)
 	if err != nil {
 		return err
 	}
-	err = enc.VerifySignature(append(s.cfg.Certificate, nonce...), signature)
-	if err != nil {
-		return err
+	// The client signs our certificate followed by the nonce. When we present
+	// a chain, the signature covers the leaf only (Part 4, 5.6.3.2). Clients
+	// that sign the whole blob, as this package's own client does, are still
+	// accepted.
+	leaf := s.cfg.Certificate
+	if c, perr := uapolicy.ParseCertificate(s.cfg.Certificate); perr == nil {
+		leaf = c.Raw
 	}
-
-	return nil
+	err = enc.VerifySignature(append(bytes.Clone(leaf), nonce...), signature)
+	if err != nil && len(leaf) != len(s.cfg.Certificate) {
+		err = enc.VerifySignature(append(bytes.Clone(s.cfg.Certificate), nonce...), signature)
+	}
+	return err
 }
 
 // EncryptUserPassword issues a new signature for the client to send in ActivateSessionRequest
@@ -73,11 +78,10 @@ func (s *SecureChannel) EncryptUserPassword(policyURI, password string, cert, no
 		return []byte(password), "", nil
 	}
 
-	remoteX509Cert, err := uapolicy.ParseCertificate(cert)
+	remoteKey, err := uapolicy.PublicKey(cert)
 	if err != nil {
 		return nil, "", err
 	}
-	remoteKey := remoteX509Cert.PublicKey.(*rsa.PublicKey)
 
 	enc, err := uapolicy.Asymmetric(policyURI, s.cfg.LocalKey, remoteKey)
 	if err != nil {
@@ -110,11 +114,10 @@ func (s *SecureChannel) NewUserTokenSignature(policyURI string, cert, nonce []by
 		return nil, "", nil
 	}
 
-	remoteX509Cert, err := uapolicy.ParseCertificate(cert)
+	remoteKey, err := uapolicy.PublicKey(cert)
 	if err != nil {
 		return nil, "", err
 	}
-	remoteKey := remoteX509Cert.PublicKey.(*rsa.PublicKey)
 
 	enc, err := uapolicy.Asymmetric(policyURI, s.cfg.UserKey, remoteKey)
 	if err != nil {

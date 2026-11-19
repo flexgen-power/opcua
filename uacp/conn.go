@@ -25,7 +25,12 @@ const (
 	DefaultReceiveBufSize = 0xffff
 	DefaultSendBufSize    = 0xffff
 	DefaultMaxChunkCount  = 512
+
 	DefaultMaxMessageSize = 2 * MB
+
+	// MinBufSize is the smallest chunk size a connection may negotiate
+	// (Part 6, 7.1.3).
+	MinBufSize = 8192
 )
 
 var (
@@ -178,6 +183,12 @@ type Conn struct {
 	id  uint32
 	ack *Acknowledge
 
+	// peerMaxMessageSize and peerMaxChunkCount are the limits a client set in
+	// its Hello on the responses it will accept; 0 means no limit. Only
+	// connections accepted by a Listener set them.
+	peerMaxMessageSize uint32
+	peerMaxChunkCount  uint32
+
 	closeOnce sync.Once
 }
 
@@ -209,6 +220,18 @@ func (c *Conn) MaxMessageSize() uint32 {
 
 func (c *Conn) MaxChunkCount() uint32 {
 	return c.ack.MaxChunkCount
+}
+
+// PeerMaxMessageSize is the largest message the client said it will accept, or
+// 0 if it set no limit. It is only set on connections a server accepted.
+func (c *Conn) PeerMaxMessageSize() uint32 {
+	return c.peerMaxMessageSize
+}
+
+// PeerMaxChunkCount is the most chunks the client said one message may have, or
+// 0 if it set no limit. It is only set on connections a server accepted.
+func (c *Conn) PeerMaxChunkCount() uint32 {
+	return c.peerMaxChunkCount
 }
 
 func (c *Conn) Close() (err error) {
@@ -308,6 +331,18 @@ func (c *Conn) srvhandshake(endpoint string) error {
 		//	c.SendError(ua.StatusBadTCPEndpointURLInvalid)
 		//	return fmt.Errorf("uacp: invalid endpoint url %s", hel.EndpointURL)
 		//}
+		// The client's Hello says how large a chunk it can receive and how large
+		// a response it will accept. Reply with our own limits, lowered to its,
+		// and keep its response limits for the sender (Part 6, 7.1.3). The ack
+		// is shared by every connection of the listener, so work on a copy.
+		ack := *c.ack
+		if hel.ReceiveBufSize != 0 && hel.ReceiveBufSize < ack.SendBufSize {
+			ack.SendBufSize = max(hel.ReceiveBufSize, MinBufSize)
+		}
+		c.ack = &ack
+		c.peerMaxMessageSize = hel.MaxMessageSize
+		c.peerMaxChunkCount = hel.MaxChunkCount
+
 		if err := c.Send("ACKF", c.ack); err != nil {
 			c.SendError(ua.StatusBadTCPInternalError)
 			return err
