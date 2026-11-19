@@ -99,6 +99,69 @@ func (c *conditionLocker) waitIfLock() {
 	c.lockMu.Unlock()
 }
 
+// sendGate holds new requests back while the channel renews its token, and
+// lets the renewal wait until every request already being sent is written.
+//
+// Checking for a renewal and counting the request happen under one lock. With
+// a separate flag and a sync.WaitGroup, a request could pass the flag check
+// just before a renewal set it and then call Add while the renewal was in
+// Wait, which the WaitGroup contract forbids and the race detector reports.
+type sendGate struct {
+	mu       sync.Mutex
+	cond     *sync.Cond
+	renewing bool
+	inFlight int
+}
+
+func newSendGate() *sendGate {
+	g := &sendGate{}
+	g.cond = sync.NewCond(&g.mu)
+	return g
+}
+
+// enter waits out a renewal, then counts a request as being sent.
+func (g *sendGate) enter() {
+	g.mu.Lock()
+	for g.renewing {
+		g.cond.Wait()
+	}
+	g.inFlight++
+	g.mu.Unlock()
+}
+
+// leave marks a request counted by enter as written.
+func (g *sendGate) leave() {
+	g.mu.Lock()
+	g.inFlight--
+	if g.inFlight == 0 {
+		g.cond.Broadcast()
+	}
+	g.mu.Unlock()
+}
+
+// beginRenew holds back new requests, waits for one renewal at a time, and
+// returns once every request already entered is written.
+func (g *sendGate) beginRenew() {
+	g.mu.Lock()
+	for g.renewing {
+		g.cond.Wait()
+	}
+	g.renewing = true
+	for g.inFlight > 0 {
+		g.cond.Wait()
+	}
+	g.mu.Unlock()
+}
+
+// endRenew lets held requests through. close also calls it, so nothing waits
+// on a renewal that will never finish.
+func (g *sendGate) endRenew() {
+	g.mu.Lock()
+	g.renewing = false
+	g.cond.Broadcast()
+	g.mu.Unlock()
+}
+
 type SecureChannel struct {
 	endpointURL string
 
@@ -132,9 +195,8 @@ type SecureChannel struct {
 	peer atomic.Pointer[PeerSecurity]
 
 	// prevent sending msg when secure channel renewal occurs
-	reqLocker  *conditionLocker
-	rcvLocker  *conditionLocker
-	pendingReq sync.WaitGroup
+	sendGate  *sendGate
+	rcvLocker *conditionLocker
 
 	// handles maps requestIDs to response channels
 	handlers   map[uint32]chan *MessageBody
@@ -230,7 +292,7 @@ func newSecureChannel(endpoint string, c *uacp.Conn, cfg *Config, kind channelKi
 		// secureChannelID: secureChannelID,
 		// sequenceNumber:  sequenceNumber,
 		// securityTokenID: securityTokenID,
-		reqLocker:    newConditionLocker(),
+		sendGate:     newSendGate(),
 		rcvLocker:    newConditionLocker(),
 		errch:        errCh,
 		closing:      make(chan struct{}),
@@ -718,7 +780,7 @@ func (s *SecureChannel) open(ctx context.Context, instance *channelInstance, req
 			return errors.Errorf("got %T, want OpenSecureChannelResponse", v)
 		}
 		return s.handleOpenSecureChannelResponse(resp, localNonce, s.openingInstance)
-	})
+	}, nil)
 }
 
 func (s *SecureChannel) handleOpenSecureChannelResponse(resp *ua.OpenSecureChannelResponse, localNonce []byte, instance *channelInstance) (err error) {
@@ -961,10 +1023,9 @@ func (s *SecureChannel) scheduleRenewal(instance *channelInstance) {
 }
 
 func (s *SecureChannel) renew(instance *channelInstance) error {
-	// lock ensure no one else renews this at the same time
-	s.reqLocker.lock()
-	defer s.reqLocker.unlock()
-	s.pendingReq.Wait()
+	// hold back new requests, one renewal at a time, until the token is renewed
+	s.sendGate.beginRenew()
+	defer s.sendGate.endRenew()
 	instance.Lock()
 	defer instance.Unlock()
 
@@ -1017,13 +1078,15 @@ func (s *SecureChannel) sendRequestWithTimeout(
 	instance *channelInstance,
 	authToken *ua.NodeID,
 	timeout time.Duration,
-	h ResponseHandler) error {
+	h ResponseHandler,
+	sent func()) error {
 
-	s.pendingReq.Add(1)
 	respRequired := h != nil
 
 	ch, err := s.sendAsyncWithTimeout(ctx, req, reqID, instance, authToken, respRequired, timeout)
-	s.pendingReq.Done()
+	if sent != nil {
+		sent()
+	}
 	if err != nil {
 		return err
 	}
@@ -1083,13 +1146,14 @@ func (s *SecureChannel) SendRequest(ctx context.Context, req ua.Request, authTok
 }
 
 func (s *SecureChannel) SendRequestWithTimeout(ctx context.Context, req ua.Request, authToken *ua.NodeID, timeout time.Duration, h ResponseHandler) error {
-	s.reqLocker.waitIfLock()
+	s.sendGate.enter()
 	active, err := s.getActiveChannelInstance()
 	if err != nil {
+		s.sendGate.leave()
 		return err
 	}
 
-	return s.sendRequestWithTimeout(ctx, req, s.nextRequestID(), active, authToken, timeout, h)
+	return s.sendRequestWithTimeout(ctx, req, s.nextRequestID(), active, authToken, timeout, h, s.sendGate.leave)
 }
 
 func (s *SecureChannel) sendAsyncWithTimeout(
@@ -1456,7 +1520,7 @@ func (s *SecureChannel) close() error {
 		close(s.closing)
 	}()
 
-	s.reqLocker.unlock()
+	s.sendGate.endRenew()
 	s.rcvLocker.unlock()
 
 	select {
