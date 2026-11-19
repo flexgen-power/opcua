@@ -806,6 +806,7 @@ func (s *SecureChannel) handleOpenSecureChannelRequest(reqID uint32, svc ua.Requ
 		}
 	}
 
+	prevLifetime := time.Duration(s.cfg.Lifetime) * time.Millisecond
 	s.cfg.Lifetime = req.RequestedLifetime
 	if !renewal {
 		s.cfg.SecurityMode = req.SecurityMode
@@ -844,10 +845,15 @@ func (s *SecureChannel) handleOpenSecureChannelRequest(reqID uint32, svc ua.Requ
 	}
 
 	instance := s.openingInstance
-	instance.algo = algo
 	instance.sc.requestID = req.RequestHeader.RequestHandle // todo(fs): is this correct?
 
-	nonce := make([]byte, instance.algo.NonceLength())
+	// A renewal issues a new token. Only this goroutine writes the token ID.
+	tokenID := instance.securityTokenID
+	if renewal {
+		tokenID++
+	}
+
+	nonce := make([]byte, algo.NonceLength())
 	if _, err := rand.Read(nonce); err != nil {
 		return err
 	}
@@ -862,7 +868,7 @@ func (s *SecureChannel) handleOpenSecureChannelRequest(reqID uint32, svc ua.Requ
 		ServerProtocolVersion: 0,
 		SecurityToken: &ua.ChannelSecurityToken{
 			ChannelID:       instance.secureChannelID,
-			TokenID:         instance.securityTokenID,
+			TokenID:         tokenID,
 			CreatedAt:       s.timeNow(),
 			RevisedLifetime: req.RequestedLifetime,
 		},
@@ -876,23 +882,37 @@ func (s *SecureChannel) handleOpenSecureChannelRequest(reqID uint32, svc ua.Requ
 	// live one, and senders on other goroutines use its algorithm with the
 	// instance locked, so the whole switch happens under that lock: no send
 	// can see the asymmetric algorithm, or keys that are half replaced.
-	instance.Lock()
-	prev := instance.algo
-	instance.algo = algo
-	err = s.sendResponseLocked(ctx, instance, reqID, resp)
-	if err == nil {
-		var sym *uapolicy.EncryptionAlgorithm
-		if sym, err = uapolicy.Symmetric(s.cfg.SecurityPolicyURI, nonce, req.ClientNonce); err == nil {
-			instance.algo = sym
-			instance.SetMaximumBodySize(int(s.c.SendBufSize()))
-			instance.state = channelActive // todo(fs): is this correct?
-			// s.setState(secureChannelOpen)
+	err = func() (err error) {
+		instance.Lock()
+		defer instance.Unlock()
+		prev := instance.algo
+		defer func() {
+			if err != nil {
+				instance.algo = prev
+			}
+		}()
+		instance.algo = algo
+		if err = s.sendResponseLocked(ctx, instance, reqID, resp); err != nil {
+			return err
 		}
-	}
-	if err != nil {
-		instance.algo = prev
-	}
-	instance.Unlock()
+		sym, err := uapolicy.Symmetric(s.cfg.SecurityPolicyURI, nonce, req.ClientNonce)
+		if err != nil {
+			return err
+		}
+		if renewal {
+			// Requests the client sent before it saw this response are
+			// still secured with the old token. Keep its keys for the rest
+			// of its lifetime so they verify.
+			instance.prevAlgo = prev
+			instance.prevTokenID = instance.securityTokenID
+			instance.prevExpires = time.Now().Add(prevLifetime / 4)
+		}
+		instance.securityTokenID = tokenID
+		instance.algo = sym
+		instance.SetMaximumBodySize(int(s.c.SendBufSize()))
+		instance.state = channelActive // todo(fs): is this correct?
+		return nil
+	}()
 	if err != nil {
 		return err
 	}

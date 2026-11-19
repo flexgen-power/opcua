@@ -36,6 +36,14 @@ type channelInstance struct {
 	algo            *uapolicy.EncryptionAlgorithm
 	maxBodySize     uint32
 
+	// prevAlgo holds the keys of the token a server channel replaced at its
+	// last renewal. A client may still have requests in flight under that
+	// token, so chunks carrying prevTokenID verify against it until
+	// prevExpires (Part 4, 5.5.2.1). Only the receive goroutine touches them.
+	prevAlgo    *uapolicy.EncryptionAlgorithm
+	prevTokenID uint32
+	prevExpires time.Time
+
 	bytesSent uint64 // atomic.Load/Store - needs to be aligned for 32bit systems
 	// bytesReceived    uint64
 	messagesSent uint32 // atomic.Load/Store
@@ -273,7 +281,12 @@ func (c *channelInstance) verifyAndDecrypt(m *MessageChunk, r []byte) ([]byte, e
 	// peer is authenticated: a chunk that is too short for the signature or
 	// padding it claims must be refused, never sliced. An unchecked slice
 	// panics the receive goroutine and with it the whole process.
-	if c.algo == nil {
+	algo := c.algo
+	if !isAsymmetric && c.prevAlgo != nil && m.SymmetricSecurityHeader != nil &&
+		m.SymmetricSecurityHeader.TokenID == c.prevTokenID && time.Now().Before(c.prevExpires) {
+		algo = c.prevAlgo
+	}
+	if algo == nil {
 		return nil, ua.StatusBadSecurityChecksFailed
 	}
 
@@ -293,21 +306,21 @@ func (c *channelInstance) verifyAndDecrypt(m *MessageChunk, r []byte) ([]byte, e
 
 	encrypted := c.sc.cfg.SecurityMode == ua.MessageSecurityModeSignAndEncrypt || isAsymmetric
 	if encrypted {
-		p, err := c.algo.Decrypt(b[headerLength:])
+		p, err := algo.Decrypt(b[headerLength:])
 		if err != nil {
 			return nil, ua.StatusBadSecurityChecksFailed
 		}
 		b = append(b[:headerLength], p...)
 	}
 
-	sigLen := c.algo.RemoteSignatureLength()
+	sigLen := algo.RemoteSignatureLength()
 	if sigLen < 0 || len(b)-headerLength < sigLen {
 		return nil, ua.StatusBadSecurityChecksFailed
 	}
 	signature := b[len(b)-sigLen:]
 	messageToVerify := b[:len(b)-sigLen]
 
-	if err := c.algo.VerifySignature(messageToVerify, signature); err != nil {
+	if err := algo.VerifySignature(messageToVerify, signature); err != nil {
 		return nil, ua.StatusBadSecurityChecksFailed
 	}
 
@@ -316,7 +329,7 @@ func (c *channelInstance) verifyAndDecrypt(m *MessageChunk, r []byte) ([]byte, e
 		// The padding size occupies one byte, or two when the signature is
 		// longer than 256 bytes; they are the last bytes before the signature.
 		sizeBytes := 1
-		if c.algo.SignatureLength() > 256 {
+		if algo.SignatureLength() > 256 {
 			sizeBytes = 2
 		}
 		if len(messageToVerify)-headerLength < sizeBytes {
