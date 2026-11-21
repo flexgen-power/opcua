@@ -47,6 +47,10 @@ type channelInstance struct {
 
 	// Outgoing messages keep the token already known to the peer until a
 	// verified chunk uses the replacement (or that outgoing token expires).
+	// previousSend is guarded by the instance mutex: the receive goroutine
+	// sets it at a renewal, and senders read it while they build and sign a
+	// message. waitingForPeer is atomic because verifyAndDecrypt clears it
+	// on the receive goroutine without holding the mutex.
 	previousSend   *serverSendToken
 	waitingForPeer atomic.Bool
 
@@ -292,6 +296,11 @@ func (c *channelInstance) signAndEncrypt(m *Message, b []byte) ([]byte, error) {
 // policy, or any symmetric message regardless of policy. This carve-out is the
 // replacement for the readChunk SecurityMode override (added in #817); that
 // override is no longer present and this guard takes its place.
+//
+// On a server channel, an accepted symmetric chunk that carries the current
+// token ID also clears waitingForPeer: the peer has switched to the token of
+// the last renewal, so outgoing messages use it from then on (see
+// outgoingTokenID).
 func (c *channelInstance) verifyAndDecrypt(m *MessageChunk, r []byte) (plain []byte, err error) {
 	defer func() {
 		if err == nil && c.sc.kind == server && m.SymmetricSecurityHeader != nil && m.SymmetricSecurityHeader.TokenID == c.securityTokenID {
