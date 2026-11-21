@@ -225,6 +225,40 @@ func TestRegisterConnExitsOnContextDoneWhileDispatching(t *testing.T) {
 	}
 }
 
+// The channel_registered and channel_closed diagnostics name the peer, so a
+// log consumer can tell which client a secure channel belongs to.
+func TestRegisterConnReportsPeerAddressOnChannelEvents(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	logger := &recordingLogger{}
+	cb := newChannelBroker(logger, time.Second, 0)
+	bc := registerLoopbackConn(t, ctx, cb)
+
+	cancel()
+	select {
+	case <-bc.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("RegisterConn ignored context cancellation")
+	}
+	peer := `"remote_addr":"` + bc.clientC.LocalAddr().String() + `"`
+	for _, event := range []string{"channel_registered", "channel_closed"} {
+		want := `"event":"` + event + `"`
+		found := false
+		logger.mu.Lock()
+		for _, m := range logger.msgs {
+			if strings.Contains(m, want) && strings.Contains(m, peer) {
+				found = true
+				break
+			}
+		}
+		logger.mu.Unlock()
+		if !found {
+			t.Errorf("%s diagnostic does not carry %s", event, peer)
+		}
+	}
+}
+
 // Readers queue behind each other on the unbuffered hand-off, so a dispatcher
 // that keeps accepting messages must not cause any reader to time out even
 // when the backlog takes longer than the bound to drain.
