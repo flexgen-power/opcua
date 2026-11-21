@@ -69,6 +69,79 @@ func TestIdleSessionReapsSubscriptionsAndMonitoredItems(t *testing.T) {
 	requireStatus(t, err, ua.StatusBadSessionIDInvalid)
 }
 
+// timedSession activates a session with the given timeout, waiting
+// beforeActivate between CreateSession and ActivateSession.
+func timedSession(t *testing.T, ctx context.Context, timeout, beforeActivate time.Duration) (*secureServer, *opcua.Client) {
+	t.Helper()
+	ss := startSecureServer(t, server.EnableSecurity("None", ua.MessageSecurityModeNone), server.EnableAuthMode(ua.UserTokenTypeAnonymous))
+	c, err := opcua.NewClient(ss.addr, opcua.SecurityMode(ua.MessageSecurityModeNone), opcua.AutoReconnect(false))
+	require.NoError(t, err)
+	require.NoError(t, c.Dial(ctx))
+	t.Cleanup(func() { c.Close(context.Background()) })
+	cfg := opcua.DefaultSessionConfig()
+	cfg.SessionTimeout = timeout
+	sess, err := c.CreateSession(ctx, cfg)
+	require.NoError(t, err)
+	time.Sleep(beforeActivate)
+	require.NoError(t, c.ActivateSession(ctx, sess))
+	return ss, c
+}
+
+// Every request a session accepts restarts its idle clock, so a session in use
+// outlives its timeout.
+func TestRequestsKeepSessionAlive(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	ss, c := timedSession(t, ctx, time.Second, 0)
+	for deadline := time.Now().Add(2500 * time.Millisecond); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
+		_, err := c.Read(ctx, &ua.ReadRequest{NodesToRead: []*ua.ReadValueID{{NodeID: ss.node.ID(), AttributeID: ua.AttributeIDValue}}})
+		require.NoError(t, err)
+	}
+	require.Equal(t, 1, ss.srv.SessionCount())
+}
+
+// A client that only subscribes sends nothing but Publish requests, and those
+// alone keep its session and subscription alive.
+func TestPublishKeepsSessionAlive(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	ss := startSecureServer(t, server.EnableSecurity("None", ua.MessageSecurityModeNone), server.EnableAuthMode(ua.UserTokenTypeAnonymous))
+	c, err := opcua.NewClient(ss.addr, opcua.SecurityMode(ua.MessageSecurityModeNone), opcua.AuthAnonymous(), opcua.SessionTimeout(time.Second), opcua.AutoReconnect(false))
+	require.NoError(t, err)
+	// Connect, not Dial: the client runs its publish loop only after Connect.
+	require.NoError(t, c.Connect(ctx))
+	t.Cleanup(func() { c.Close(context.Background()) })
+	notifs := make(chan *opcua.PublishNotificationData, 64)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-notifs:
+			}
+		}
+	}()
+	_, err = c.Subscribe(ctx, &opcua.SubscriptionParameters{Interval: 100 * time.Millisecond, MaxKeepAliveCount: 2}, notifs)
+	require.NoError(t, err)
+	time.Sleep(2500 * time.Millisecond)
+	require.Equal(t, 1, ss.srv.SessionCount())
+	ss.srv.SubscriptionService.Mu.Lock()
+	subs := len(ss.srv.SubscriptionService.Subs)
+	ss.srv.SubscriptionService.Mu.Unlock()
+	require.Equal(t, 1, subs)
+}
+
+// ActivateSession restarts the idle clock, so the timeout runs from the last
+// activation, not from CreateSession.
+func TestActivateSessionRestartsIdleClock(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	ss, c := timedSession(t, ctx, time.Second, 600*time.Millisecond)
+	time.Sleep(600 * time.Millisecond)
+	_, err := c.Read(ctx, &ua.ReadRequest{NodesToRead: []*ua.ReadValueID{{NodeID: ss.node.ID(), AttributeID: ua.AttributeIDValue}}})
+	require.NoError(t, err)
+}
+
 // Publish requests the server holds for a subscription are outstanding requests
 // on the session. When the session times out they must be answered with
 // Bad_SessionClosed (Part 4, 5.6.2), not left for the client to time out.
