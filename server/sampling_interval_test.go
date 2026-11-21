@@ -121,3 +121,60 @@ func TestSamplingRetainsFinalUpdateAcrossConsecutiveWindows(t *testing.T) {
 		sub.drainPending(make(map[uint32]*ua.MonitoredItemNotification))
 	}
 }
+
+// CreateMonitoredItems revises each item's sampling interval against its node's
+// MinimumSamplingInterval attribute, samples at that revised interval, and
+// rejects an item that does not name a node.
+func TestCreateMonitoredItemsHonorsNodeMinimumSamplingInterval(t *testing.T) {
+	srv := New()
+	srv.initHandlers()
+	sess := srv.sb.NewSession()
+	subID := createTestSubscription(t, srv, sess)
+	ns := NewNodeNameSpace(srv, "sampling")
+	node := NewVariableNode(ua.NewStringNodeID(ns.ID(), "floor"), "floor", int32(0))
+	if err := node.SetAttribute(ua.AttributeIDMinimumSamplingInterval, DataValueFromValue(1000.0)); err != nil {
+		t.Fatalf("SetAttribute: %v", err)
+	}
+	ns.AddNode(node)
+
+	monitor := func(handle uint32, interval float64) *ua.MonitoredItemCreateRequest {
+		return &ua.MonitoredItemCreateRequest{
+			ItemToMonitor:       &ua.ReadValueID{NodeID: node.ID(), AttributeID: ua.AttributeIDValue},
+			MonitoringMode:      ua.MonitoringModeReporting,
+			RequestedParameters: &ua.MonitoringParameters{ClientHandle: handle, SamplingInterval: interval},
+		}
+	}
+	resp, err := srv.MonitoredItemService.CreateMonitoredItems(nil, &ua.CreateMonitoredItemsRequest{
+		RequestHeader:  &ua.RequestHeader{AuthenticationToken: sess.AuthTokenID},
+		SubscriptionID: subID,
+		ItemsToCreate:  []*ua.MonitoredItemCreateRequest{monitor(1, 100), monitor(2, 2000), {}},
+	}, 0)
+	if err != nil {
+		t.Fatalf("CreateMonitoredItems: %v", err)
+	}
+	results := resp.(*ua.CreateMonitoredItemsResponse).Results
+	if len(results) != 3 {
+		t.Fatalf("%d results, want 3", len(results))
+	}
+	for i, want := range []float64{1000, 2000} {
+		r := results[i]
+		if r.StatusCode != ua.StatusOK || r.RevisedSamplingInterval != want {
+			t.Fatalf("result %d = %+v, want StatusOK with revised interval %v", i, r, want)
+		}
+		srv.MonitoredItemService.Mu.Lock()
+		item := srv.MonitoredItemService.Items[r.MonitoredItemID]
+		srv.MonitoredItemService.Mu.Unlock()
+		if item == nil {
+			t.Fatalf("item %d (id %d) was not registered", i, r.MonitoredItemID)
+		}
+		item.sampleMu.Lock()
+		got := item.sampleInterval
+		item.sampleMu.Unlock()
+		if got != time.Duration(want)*time.Millisecond {
+			t.Fatalf("item %d samples every %v, want %v ms", i, got, want)
+		}
+	}
+	if got := results[2].StatusCode; got != ua.StatusBadInvalidArgument {
+		t.Fatalf("empty item result %v, want BadInvalidArgument", got)
+	}
+}
