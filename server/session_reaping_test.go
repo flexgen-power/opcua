@@ -68,3 +68,45 @@ func TestIdleSessionReapsSubscriptionsAndMonitoredItems(t *testing.T) {
 	_, err = c.Read(ctx, &ua.ReadRequest{NodesToRead: []*ua.ReadValueID{{NodeID: ss.node.ID(), AttributeID: ua.AttributeIDValue}}})
 	requireStatus(t, err, ua.StatusBadSessionIDInvalid)
 }
+
+// Publish requests the server holds for a subscription are outstanding requests
+// on the session. When the session times out they must be answered with
+// Bad_SessionClosed (Part 4, 5.6.2), not left for the client to time out.
+func TestReapedSessionAbortsHeldPublishRequests(t *testing.T) {
+	ss := startSecureServer(t, server.EnableSecurity("None", ua.MessageSecurityModeNone), server.EnableAuthMode(ua.UserTokenTypeAnonymous))
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	c, err := opcua.NewClient(ss.addr, opcua.SecurityMode(ua.MessageSecurityModeNone), opcua.AutoReconnect(false))
+	require.NoError(t, err)
+	require.NoError(t, c.Dial(ctx))
+	defer c.Close(ctx)
+	cfg := opcua.DefaultSessionConfig()
+	cfg.SessionTimeout = 500 * time.Millisecond
+	sess, err := c.CreateSession(ctx, cfg)
+	require.NoError(t, err)
+	require.NoError(t, c.ActivateSession(ctx, sess))
+	token := ss.srv.ActivatedSessionTokens()[0]
+	// The first keepalive is due (10+1) x 500 ms after this, well after the
+	// session times out, so the subscription answers none of the requests.
+	_, err = sendFor(ctx, c.SecureChannel(), &ua.CreateSubscriptionRequest{
+		RequestedPublishingInterval: 500, RequestedLifetimeCount: 1000, RequestedMaxKeepAliveCount: 10, PublishingEnabled: true,
+	}, token, time.Second)
+	require.NoError(t, err)
+
+	const held = 3
+	start := time.Now()
+	errs := make(chan error, held)
+	for range held {
+		go func() {
+			_, err := sendFor(ctx, c.SecureChannel(), &ua.PublishRequest{
+				SubscriptionAcknowledgements: []*ua.SubscriptionAcknowledgement{},
+			}, token, 3*time.Second)
+			errs <- err
+		}()
+	}
+	for range held {
+		requireStatus(t, <-errs, ua.StatusBadSessionClosed)
+	}
+	require.Less(t, time.Since(start), 2*time.Second, "held Publish requests were answered only by the client's timeout")
+	require.Equal(t, 0, ss.srv.SessionCount())
+}

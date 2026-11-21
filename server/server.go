@@ -322,6 +322,23 @@ func (s *Server) closeExpiredSessions(sessions []*session) {
 		if s.SubscriptionService != nil {
 			s.SubscriptionService.deleteSessionSubscriptions(sess)
 		}
+		abortPublishRequests(sess)
+	}
+}
+
+// abortPublishRequests answers every Publish request still queued on a
+// terminated session with Bad_SessionClosed (Part 4, 5.6.2). Nothing else will
+// ever take them off the queue.
+func abortPublishRequests(sess *session) {
+	for {
+		select {
+		case pr := <-sess.PublishRequests:
+			ctx, cancel := context.WithTimeout(context.Background(), errorNotifyTimeout)
+			_ = pr.Channel.SendResponseWithContext(ctx, pr.ID, &ua.ServiceFault{ResponseHeader: responseHeader(requestHandle(pr.Req), ua.StatusBadSessionClosed)})
+			cancel()
+		default:
+			return
+		}
 	}
 }
 
