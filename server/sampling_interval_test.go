@@ -82,3 +82,42 @@ func TestSamplingCoalescesFinalUpdateAndStopsOnDeletion(t *testing.T) {
 		t.Fatalf("deleted item delivered %d pending notifications", got)
 	}
 }
+
+func TestSamplingRetainsFinalUpdateAcrossConsecutiveWindows(t *testing.T) {
+	srv := New()
+	srv.initHandlers()
+	ns := NewNodeNameSpace(srv, "sampling")
+	var value atomic.Int32
+	node := ns.AddNode(NewVariableNode(ua.NewStringNodeID(ns.ID(), "value"), "value", ValueFunc(func() *ua.DataValue {
+		return DataValueFromValue(value.Load())
+	})))
+	sub := NewSubscription()
+	monitorNode(srv, sub, 1, node.ID(), 42)
+	item := srv.MonitoredItemService.Nodes[node.ID().String()][0]
+	item.sampleInterval = 100 * time.Millisecond
+	srv.MonitoredItemService.Items[item.ID] = item
+	srv.MonitoredItemService.Subs[sub.ID] = []*MonitoredItem{item}
+	t.Cleanup(func() { srv.MonitoredItemService.DeleteMonitoredItem(item.ID) })
+
+	srv.ChangeNotification(node.ID())
+	sub.drainPending(make(map[uint32]*ua.MonitoredItemNotification))
+	// Each burst lands inside the window that the previous timer-delivered
+	// sample opened, so every final value must arrive through a new timer.
+	for _, final := range []int32{10, 20, 30} {
+		for v := final - 9; v <= final; v++ {
+			value.Store(v)
+			srv.ChangeNotification(node.ID())
+		}
+		if got := sub.PendingNotifications(); got != 0 {
+			t.Fatalf("window ending %d: %d notifications before the sampling interval", final, got)
+		}
+		deadline := time.Now().Add(2 * time.Second)
+		for sub.PendingNotifications() == 0 && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+		if got, ok := pendingValue(t, sub, 42); !ok || got != final {
+			t.Fatalf("window ending %d delivered %d (present %v)", final, got, ok)
+		}
+		sub.drainPending(make(map[uint32]*ua.MonitoredItemNotification))
+	}
+}
