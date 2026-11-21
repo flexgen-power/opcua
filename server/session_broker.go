@@ -37,6 +37,8 @@ type session struct {
 	identity  string
 
 	PublishRequests chan PubReq
+	// lastActivity is guarded by the broker mutex; it retains the monotonic clock.
+	lastActivity time.Time
 }
 
 type sessionConfig struct {
@@ -48,31 +50,115 @@ type sessionBroker struct {
 	mu sync.Mutex
 
 	// s contains all sessions watched by the session broker
-	s      map[string]*session
-	logger Logger
+	s        map[string]*session
+	channels map[uint32]bool
+	logger   Logger
 }
 
 func newSessionBroker(logger Logger) *sessionBroker {
 	return &sessionBroker{
-		s:      make(map[string]*session),
-		logger: logger,
+		s:        make(map[string]*session),
+		channels: make(map[uint32]bool),
+		logger:   logger,
 	}
 }
 
 func (sb *sessionBroker) NewSession() *session {
+	s := newSession()
+	sb.mu.Lock()
+	sb.s[s.AuthTokenID.String()] = s
+	sb.mu.Unlock()
+	return s
+}
+
+func newSession() *session {
 	s := &session{
-		ID: ua.NewGUIDNodeID(1, uuid.New().String()),
+		cfg: sessionConfig{sessionTimeout: sessionTimeoutDefault},
+		ID:  ua.NewGUIDNodeID(1, uuid.New().String()),
 		// The token is what a session is looked up by. A 31-bit math/rand
 		// number can be guessed; a random GUID cannot.
 		AuthTokenID:     ua.NewGUIDNodeID(0, uuid.New().String()),
 		PublishRequests: make(chan PubReq, 100),
+		lastActivity:    time.Now(),
 	}
-
-	sb.mu.Lock()
-	sb.s[s.AuthTokenID.String()] = s
-	sb.mu.Unlock()
-
 	return s
+}
+
+const maxUnactivatedSessionsPerChannel = 16
+
+func (sb *sessionBroker) newSessionOnChannel(channel uint32, timeout time.Duration, nonce, certificate []byte) (*session, error) {
+	sb.mu.Lock()
+	defer sb.mu.Unlock()
+	if !sb.channels[channel] {
+		return nil, ua.StatusBadSecureChannelClosed
+	}
+	unactivated := 0
+	for _, s := range sb.s {
+		if s.createChannelID == channel && !s.activated.Load() {
+			unactivated++
+		}
+	}
+	if unactivated >= maxUnactivatedSessionsPerChannel {
+		return nil, ua.StatusBadTooManySessions
+	}
+	s := newSession()
+	s.createChannelID = channel
+	s.cfg.sessionTimeout = timeout
+	s.serverNonce = nonce
+	s.remoteCertificate = certificate
+	sb.s[s.AuthTokenID.String()] = s
+	return s, nil
+}
+
+func (sb *sessionBroker) removeMatching(match func(*session) bool) []*session {
+	sb.mu.Lock()
+	defer sb.mu.Unlock()
+	var removed []*session
+	for token, s := range sb.s {
+		if match(s) {
+			delete(sb.s, token)
+			removed = append(removed, s)
+		}
+	}
+	return removed
+}
+
+func (sb *sessionBroker) closeUnactivated(channel uint32) {
+	sb.mu.Lock()
+	defer sb.mu.Unlock()
+	delete(sb.channels, channel)
+	for token, s := range sb.s {
+		if s.createChannelID == channel && !s.activated.Load() {
+			delete(sb.s, token)
+		}
+	}
+}
+
+func (sb *sessionBroker) channelOpened(channel uint32) {
+	sb.mu.Lock()
+	defer sb.mu.Unlock()
+	sb.channels[channel] = true
+}
+
+func (sb *sessionBroker) expired(now time.Time) []*session {
+	return sb.removeMatching(func(s *session) bool { return !now.Before(s.lastActivity.Add(s.cfg.sessionTimeout)) })
+}
+
+// touch checks expiry and records only a request accepted for this session.
+// An expired or concurrently removed session cannot be resurrected by traffic.
+func (sb *sessionBroker) touch(s *session, now time.Time) (bool, *session) {
+	sb.mu.Lock()
+	defer sb.mu.Unlock()
+	key := s.AuthTokenID.String()
+	if sb.s[key] != s {
+		return false, nil
+	}
+	if !now.Before(s.lastActivity.Add(s.cfg.sessionTimeout)) {
+		delete(sb.s, key)
+		return false, s
+	}
+	s.lastActivity = now
+	return true, nil
 }
 
 func (sb *sessionBroker) Close(authToken *ua.NodeID) error {
