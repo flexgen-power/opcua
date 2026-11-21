@@ -238,6 +238,9 @@ func (s *Server) checkSession(sc *uasc.SecureChannel, typeID uint16, req ua.Requ
 	if sess.channelID.Load() != sc.ID() {
 		return ua.StatusBadSecureChannelIDInvalid
 	}
+	if !s.touchSession(sess) {
+		return ua.StatusBadSessionIDInvalid
+	}
 	return ua.StatusOK
 }
 
