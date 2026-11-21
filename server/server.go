@@ -38,9 +38,11 @@ type Server struct {
 	endpoints  []*ua.EndpointDescription
 	namespaces []NameSpace
 
-	l  *uacp.Listener
-	cb *channelBroker
-	sb *sessionBroker
+	l                *uacp.Listener
+	cb               *channelBroker
+	sb               *sessionBroker
+	sessionsStop     chan struct{}
+	sessionsStopOnce sync.Once
 
 	// nextSecureChannelID uint32
 
@@ -123,11 +125,12 @@ func New(opts ...Option) *Server {
 	}
 
 	s := &Server{
-		url:      url,
-		cfg:      cfg,
-		cb:       newChannelBroker(cfg.logger, cfg.responseWriteTimeout, cfg.requestDispatchTimeout),
-		sb:       newSessionBroker(cfg.logger),
-		handlers: make(map[uint16]Handler),
+		url:          url,
+		cfg:          cfg,
+		cb:           newChannelBroker(cfg.logger, cfg.responseWriteTimeout, cfg.requestDispatchTimeout),
+		sb:           newSessionBroker(cfg.logger),
+		sessionsStop: make(chan struct{}),
+		handlers:     make(map[uint16]Handler),
 		namespaces: []NameSpace{
 			NewNameSpace("http://opcfoundation.org/UA/"), // ns:0
 		},
@@ -282,8 +285,11 @@ func (s *Server) Start(ctx context.Context) error {
 		s.cb.certValidator = s.cfg.clientCertValidator
 	}
 
+	s.cb.onClosed = s.sb.closeUnactivated
+	s.cb.onRegistered = s.sb.channelOpened
 	go s.acceptAndRegister(ctx, s.l)
 	go s.monitorConnections(ctx)
+	go s.monitorSessions(ctx)
 
 	return nil
 }
@@ -298,6 +304,7 @@ func (s *Server) setServerState(state ua.ServerState) {
 // and stops listening on all endpoints
 func (s *Server) Close() error {
 	s.setServerState(ua.ServerStateShutdown)
+	s.sessionsStopOnce.Do(func() { close(s.sessionsStop) })
 
 	// Close the listener, preventing new sessions from starting
 	if s.l != nil {
@@ -305,7 +312,40 @@ func (s *Server) Close() error {
 	}
 
 	// Shut down all secure channels and UACP connections
-	return s.cb.Close()
+	err := s.cb.Close()
+	s.closeExpiredSessions(s.sb.removeMatching(func(*session) bool { return true }))
+	return err
+}
+
+func (s *Server) closeExpiredSessions(sessions []*session) {
+	for _, sess := range sessions {
+		if s.SubscriptionService != nil {
+			s.SubscriptionService.deleteSessionSubscriptions(sess)
+		}
+	}
+}
+
+func (s *Server) touchSession(sess *session) bool {
+	ok, expired := s.sb.touch(sess, time.Now())
+	if expired != nil {
+		s.closeExpiredSessions([]*session{expired})
+	}
+	return ok
+}
+
+func (s *Server) monitorSessions(ctx context.Context) {
+	ticker := time.NewTicker(sessionTimeoutMin)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.sessionsStop:
+			return
+		case now := <-ticker.C:
+			s.closeExpiredSessions(s.sb.expired(now))
+		}
+	}
 }
 
 type temporary interface {

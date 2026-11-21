@@ -52,14 +52,10 @@ func (s *SessionService) CreateSession(sc *uasc.SecureChannel, r ua.Request, req
 		return nil, ua.StatusBadSecurityChecksFailed
 	}
 
-	// New session
-	sess := s.srv.sb.NewSession()
-	sess.createChannelID = sc.ID()
-
 	// Ensure session timeout is reasonable
-	sess.cfg.sessionTimeout = time.Duration(req.RequestedSessionTimeout) * time.Millisecond
-	if sess.cfg.sessionTimeout > sessionTimeoutMax || sess.cfg.sessionTimeout < sessionTimeoutMin {
-		sess.cfg.sessionTimeout = sessionTimeoutDefault
+	timeout := time.Duration(req.RequestedSessionTimeout) * time.Millisecond
+	if timeout > sessionTimeoutMax || timeout < sessionTimeoutMin {
+		timeout = sessionTimeoutDefault
 	}
 
 	nonce := make([]byte, sessionNonceLength)
@@ -67,13 +63,15 @@ func (s *SessionService) CreateSession(sc *uasc.SecureChannel, r ua.Request, req
 		log.Printf("error creating session nonce")
 		return nil, ua.StatusBadInternalError
 	}
-	sess.serverNonce = nonce
-	sess.remoteCertificate = req.ClientCertificate
-
 	sig, alg, err := sc.NewSessionSignature(req.ClientCertificate, req.ClientNonce)
 	if err != nil {
 		log.Printf("error creating session signature")
 		return nil, ua.StatusBadInternalError
+	}
+	// Publish the session only once every field the reaper observes is ready.
+	sess, err := s.srv.sb.newSessionOnChannel(sc.ID(), timeout, nonce, req.ClientCertificate)
+	if err != nil {
+		return nil, err
 	}
 
 	matching_endpoints := make([]*ua.EndpointDescription, 0)
@@ -164,6 +162,9 @@ func (s *SessionService) ActivateSession(sc *uasc.SecureChannel, r ua.Request, r
 			s.warn("ActivateSession from %s refused: session cannot move to a different identity: %s", remoteAddr(sc), code)
 			return nil, code
 		}
+	}
+	if !s.srv.touchSession(sess) {
+		return nil, ua.StatusBadSessionIDInvalid
 	}
 
 	nonce := make([]byte, sessionNonceLength)
