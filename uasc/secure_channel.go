@@ -948,6 +948,14 @@ func (s *SecureChannel) handleOpenSecureChannelRequest(reqID uint32, svc ua.Requ
 		instance.Lock()
 		defer instance.Unlock()
 		prev := instance.algo
+		oldExpires := instance.createdAt.Add(prevLifetime)
+		if instance.createdAt.IsZero() {
+			oldExpires = time.Now().Add(prevLifetime)
+		}
+		outgoing := instance.previousSend
+		if !instance.waitingForPeer.Load() || outgoing == nil || !time.Now().Before(outgoing.expires) {
+			outgoing = &serverSendToken{id: instance.securityTokenID, algo: prev, expires: oldExpires}
+		}
 		defer func() {
 			if err != nil {
 				instance.algo = prev
@@ -967,10 +975,14 @@ func (s *SecureChannel) handleOpenSecureChannelRequest(reqID uint32, svc ua.Requ
 			// of its lifetime so they verify.
 			instance.prevAlgo = prev
 			instance.prevTokenID = instance.securityTokenID
-			instance.prevExpires = time.Now().Add(prevLifetime / 4)
+			instance.prevExpires = oldExpires.Add(prevLifetime / 4)
+			instance.previousSend = outgoing
+			instance.waitingForPeer.Store(true)
 		}
 		instance.securityTokenID = tokenID
 		instance.algo = sym
+		instance.createdAt = resp.SecurityToken.CreatedAt
+		instance.revisedLifetime = time.Duration(resp.SecurityToken.RevisedLifetime) * time.Millisecond
 		instance.SetMaximumBodySize(int(s.c.SendBufSize()))
 		instance.state = channelActive // todo(fs): is this correct?
 		return nil
