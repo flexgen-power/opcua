@@ -2,6 +2,7 @@ package server
 
 import (
 	"errors"
+	"math"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -61,6 +62,7 @@ func (s *MonitoredItemService) DeleteMonitoredItem(id uint32) {
 	if item == nil || item.Req == nil || item.Req.ItemToMonitor == nil || item.Req.ItemToMonitor.NodeID == nil {
 		return
 	}
+	item.stopSampling()
 	nodeid := item.Req.ItemToMonitor.NodeID.String()
 
 	if s == nil || s.Nodes == nil || s.Nodes[nodeid] == nil {
@@ -128,6 +130,7 @@ type namespaceLookup struct {
 // change. It is captured under MonitoredItemService.Mu so that the notification
 // itself can be built and delivered after the lock has been released.
 type pendingNotification struct {
+	item         *MonitoredItem
 	sub          *Subscription
 	clientHandle uint32
 	node         *ua.NodeID
@@ -191,9 +194,16 @@ func (s *MonitoredItemService) ChangeNotifications(nodes []*ua.NodeID) {
 // the per-node lock across the read and the store restores the ordering:
 // whichever delivery for a node runs last re-reads the live value.
 func (s *MonitoredItemService) deliver(p pendingNotification) {
+	s.deliverSample(p, true)
+}
+
+func (s *MonitoredItemService) deliverSample(p pendingNotification, changed bool) {
 	lock := s.nodeLock(p.node.String())
 	lock.Lock()
 	defer lock.Unlock()
+	if p.item != nil && !p.item.sampleReady(s, p, changed) {
+		return
+	}
 
 	val := new(ua.MonitoredItemNotification)
 	val.ClientHandle = p.clientHandle
@@ -234,6 +244,7 @@ func (s *MonitoredItemService) collectNotifications(nodes []*ua.NodeID, lookups 
 				continue
 			}
 			pending = append(pending, pendingNotification{
+				item:         item,
 				sub:          item.Sub,
 				clientHandle: item.Req.RequestedParameters.ClientHandle,
 				node:         n,
@@ -260,6 +271,63 @@ type MonitoredItem struct {
 
 	//TODO: use this
 	Mode ua.MonitoringMode
+
+	// Sampling state is independent of the service bookkeeping lock: timer
+	// delivery must not take Mu while holding a node's delivery lock.
+	sampleMu       sync.Mutex
+	sampleInterval time.Duration
+	lastSample     time.Time
+	dirty          bool
+	deleted        bool
+	sampleTimer    *time.Timer
+}
+
+func (item *MonitoredItem) stopSampling() {
+	item.sampleMu.Lock()
+	defer item.sampleMu.Unlock()
+	item.deleted = true
+	if item.sampleTimer != nil {
+		item.sampleTimer.Stop()
+		item.sampleTimer = nil
+	}
+}
+
+// Keep at most one deferred sample per item. Its delivery re-reads the live
+// node, so a final update inside the interval is retained even if traffic stops.
+func (item *MonitoredItem) sampleReady(s *MonitoredItemService, p pendingNotification, changed bool) bool {
+	item.sampleMu.Lock()
+	defer item.sampleMu.Unlock()
+	if item.deleted {
+		return false
+	}
+	item.dirty = item.dirty || changed
+	if !item.dirty {
+		return false
+	}
+	now := time.Now()
+	if wait := item.lastSample.Add(item.sampleInterval).Sub(now); wait > 0 {
+		if item.sampleTimer == nil {
+			item.sampleTimer = time.AfterFunc(wait, func() { s.deliverSample(p, false) })
+		}
+		return false
+	}
+	if item.sampleTimer != nil {
+		item.sampleTimer.Stop()
+		item.sampleTimer = nil
+	}
+	item.lastSample = now
+	item.dirty = false
+	return true
+}
+
+func reviseSamplingInterval(requested, publishing, minimum float64) float64 {
+	if requested < 0 || math.IsNaN(requested) {
+		requested = publishing
+	}
+	if !(minimum >= 0) || math.IsInf(minimum, 0) {
+		minimum = 0
+	}
+	return min(max(requested, minimum), maxPublishingInterval)
 }
 
 // https://reference.opcfoundation.org/Core/Part4/v105/docs/5.13.2
@@ -277,9 +345,6 @@ func (s *MonitoredItemService) CreateMonitoredItems(sc *uasc.SecureChannel, r ua
 	if err != nil {
 		return nil, err
 	}
-	s.Mu.Lock()
-	defer s.Mu.Unlock()
-
 	count := len(req.ItemsToCreate)
 
 	res := make([]*ua.MonitoredItemCreateResult, count)
@@ -302,14 +367,42 @@ func (s *MonitoredItemService) CreateMonitoredItems(sc *uasc.SecureChannel, r ua
 	if sub.Session.AuthTokenID.String() != sess.AuthTokenID.String() {
 		return nil, errors.New("not your subscription, bro")
 	}
+	// Namespace lookup takes the server mutex. Resolve attributes before Mu,
+	// following the same lock order as ChangeNotifications.
+	intervals := make([]float64, count)
+	for i, item := range req.ItemsToCreate {
+		if item == nil || item.ItemToMonitor == nil || item.ItemToMonitor.NodeID == nil || item.RequestedParameters == nil {
+			continue
+		}
+		minimum := float64(0)
+		if ns, err := s.SubService.srv.Namespace(int(item.ItemToMonitor.NodeID.Namespace())); err == nil {
+			if value := ns.Attribute(item.ItemToMonitor.NodeID, ua.AttributeIDMinimumSamplingInterval); value != nil && value.Value != nil {
+				minimum, _ = value.Value.Value().(float64)
+			}
+		}
+		intervals[i] = reviseSamplingInterval(item.RequestedParameters.SamplingInterval, sub.RevisedPublishingInterval, minimum)
+	}
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
+	s.SubService.Mu.Lock()
+	stillExists := s.SubService.Subs[subID] == sub
+	s.SubService.Mu.Unlock()
+	if !stillExists {
+		return nil, ua.StatusBadSubscriptionIDInvalid
+	}
 
 	for i := range req.ItemsToCreate {
 		itemreq := req.ItemsToCreate[i]
+		if itemreq == nil || itemreq.ItemToMonitor == nil || itemreq.ItemToMonitor.NodeID == nil || itemreq.RequestedParameters == nil {
+			res[i] = &ua.MonitoredItemCreateResult{StatusCode: ua.StatusBadInvalidArgument}
+			continue
+		}
 		nodeid := itemreq.ItemToMonitor.NodeID
 		item := MonitoredItem{
-			ID:  s.NextID(),
-			Sub: sub,
-			Req: itemreq,
+			ID:             s.NextID(),
+			Sub:            sub,
+			Req:            itemreq,
+			sampleInterval: time.Duration(intervals[i] * float64(time.Millisecond)),
 		}
 
 		// book keeping of the new item
@@ -336,7 +429,7 @@ func (s *MonitoredItemService) CreateMonitoredItems(sc *uasc.SecureChannel, r ua
 		res[i] = &ua.MonitoredItemCreateResult{
 			StatusCode:              ua.StatusOK,
 			MonitoredItemID:         item.ID,
-			RevisedSamplingInterval: sub.RevisedPublishingInterval,
+			RevisedSamplingInterval: intervals[i],
 			RevisedQueueSize:        1,
 			FilterResult:            ua.NewExtensionObject(nil),
 		}
