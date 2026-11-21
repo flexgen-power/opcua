@@ -191,6 +191,7 @@ func (c *channelBroker) RegisterConn(ctx context.Context, conn *uacp.Conn, local
 	emitDiagInfo(c.logger, diagPayload{
 		Event:           "channel_registered",
 		SecureChannelID: secureChannelID,
+		RemoteAddr:      conn.RemoteAddr().String(),
 		ChannelCount:    &channelCount,
 	})
 	if c.logger != nil {
@@ -259,6 +260,7 @@ outer:
 	emitDiagInfo(c.logger, diagPayload{
 		Event:           "channel_closed",
 		SecureChannelID: secureChannelID,
+		RemoteAddr:      conn.RemoteAddr().String(),
 		CloseCause:      closeCause,
 		ErrorText:       closeErr,
 		ChannelCount:    &remainingChannels,
