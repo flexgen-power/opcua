@@ -2,6 +2,7 @@ package opcua
 
 import (
 	"context"
+	"sync"
 	"testing"
 
 	"github.com/gopcua/opcua/id"
@@ -9,6 +10,30 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// A canceled reconnect still assigns Dial's result to conn. Close must not
+// read that field concurrently, even when the connection never succeeds.
+func TestClientCloseConcurrentDial(t *testing.T) {
+	c, err := NewClient("opc.tcp://127.0.0.1:4840")
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var workers sync.WaitGroup
+	workers.Add(2)
+	go func() {
+		defer workers.Done()
+		for range 500 {
+			assert.Error(t, c.Dial(ctx))
+		}
+	}()
+	go func() {
+		defer workers.Done()
+		for range 500 {
+			assert.NoError(t, c.Close(ctx))
+		}
+	}()
+	workers.Wait()
+}
 
 func TestClient_Send_DoesNotPanicWhenDisconnected(t *testing.T) {
 	c, err := NewClient("opc.tcp://example.com:4840")

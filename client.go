@@ -146,7 +146,9 @@ type Client struct {
 	// cfg is the configuration for the client.
 	cfg *Config
 
-	// conn is the open connection
+	// connMu serializes Dial with connection cleanup in Close and the monitor.
+	connMu sync.Mutex
+	// conn is the open connection, guarded by connMu.
 	conn *uacp.Conn
 
 	// sechan is the open secure channel.
@@ -405,7 +407,7 @@ func (c *Client) monitor(ctx context.Context) {
 						// todo(fs): down.
 						//
 						// https://github.com/gopcua/opcua/pull/470
-						c.conn.Close()
+						c.closeConnection()
 						if sc := c.SecureChannel(); sc != nil {
 							sc.Close()
 							c.setSecureChannel(nil)
@@ -608,6 +610,8 @@ func (c *Client) monitor(ctx context.Context) {
 // Dial establishes a secure channel.
 func (c *Client) Dial(ctx context.Context) error {
 	stats.Client().Add("Dial", 1)
+	c.connMu.Lock()
+	defer c.connMu.Unlock()
 
 	if c.SecureChannel() != nil {
 		return errors.Errorf("secure channel already connected")
@@ -646,6 +650,10 @@ func (c *Client) Close(ctx context.Context) error {
 	if c.mcancel != nil {
 		c.mcancel()
 	}
+	// Cancel first so an in-flight reconnect can finish before cleanup takes
+	// ownership of the connection and secure channel.
+	c.connMu.Lock()
+	defer c.connMu.Unlock()
 	if sc := c.SecureChannel(); sc != nil {
 		sc.Close()
 		c.setSecureChannel(nil)
@@ -663,9 +671,19 @@ func (c *Client) Close(ctx context.Context) error {
 	// anything we can do about it anyway
 	if c.conn != nil {
 		c.conn.Close()
+		c.conn = nil
 	}
 
 	return nil
+}
+
+func (c *Client) closeConnection() {
+	c.connMu.Lock()
+	defer c.connMu.Unlock()
+	if c.conn != nil {
+		c.conn.Close()
+		c.conn = nil
+	}
 }
 
 // State returns the current connection state.
