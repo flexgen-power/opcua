@@ -981,6 +981,10 @@ func (s *SecureChannel) handleOpenSecureChannelRequest(reqID uint32, svc ua.Requ
 			if floor := time.Now().Add(prevLifetime / 4); instance.prevExpires.Before(floor) {
 				instance.prevExpires = floor
 			}
+			// Outgoing messages stay under the token the client is known
+			// to hold until it sends a chunk under the new token that
+			// verifies, or the held-back token's lifetime ends. See
+			// outgoingTokenID and verifyAndDecrypt.
 			instance.previousSend = outgoing
 			instance.waitingForPeer.Store(true)
 		}
