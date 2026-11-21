@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"math"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gopcua/opcua/debug"
@@ -44,10 +45,28 @@ type channelInstance struct {
 	prevTokenID uint32
 	prevExpires time.Time
 
+	// Outgoing messages keep the token already known to the peer until a
+	// verified chunk uses the replacement (or that outgoing token expires).
+	previousSend   *serverSendToken
+	waitingForPeer atomic.Bool
+
 	bytesSent uint64 // atomic.Load/Store - needs to be aligned for 32bit systems
 	// bytesReceived    uint64
 	messagesSent uint32 // atomic.Load/Store
 	// messagesReceived uint32
+}
+
+type serverSendToken struct {
+	id      uint32
+	algo    *uapolicy.EncryptionAlgorithm
+	expires time.Time
+}
+
+func (c *channelInstance) outgoingTokenID() uint32 {
+	if c.waitingForPeer.Load() && c.previousSend != nil && time.Now().Before(c.previousSend.expires) {
+		return c.previousSend.id
+	}
+	return c.securityTokenID
 }
 
 func newChannelInstance(sc *SecureChannel) *channelInstance {
@@ -121,7 +140,7 @@ func (c *channelInstance) newMessage(srv interface{}, typeID uint16, requestID u
 		return &Message{
 			MessageHeader: &MessageHeader{
 				Header:                  NewHeader(MessageTypeCloseSecureChannel, ChunkTypeFinal, c.secureChannelID),
-				SymmetricSecurityHeader: NewSymmetricSecurityHeader(c.securityTokenID),
+				SymmetricSecurityHeader: NewSymmetricSecurityHeader(c.outgoingTokenID()),
 				SequenceHeader:          NewSequenceHeader(sequenceNumber, requestID),
 			},
 			TypeID:  ua.NewFourByteExpandedNodeID(0, typeID),
@@ -132,7 +151,7 @@ func (c *channelInstance) newMessage(srv interface{}, typeID uint16, requestID u
 		return &Message{
 			MessageHeader: &MessageHeader{
 				Header:                  NewHeader(MessageTypeMessage, ChunkTypeFinal, c.secureChannelID),
-				SymmetricSecurityHeader: NewSymmetricSecurityHeader(c.securityTokenID),
+				SymmetricSecurityHeader: NewSymmetricSecurityHeader(c.outgoingTokenID()),
 				SequenceHeader:          NewSequenceHeader(sequenceNumber, requestID),
 			},
 			TypeID:  ua.NewFourByteExpandedNodeID(0, typeID),
@@ -198,6 +217,12 @@ func (c *channelInstance) signAndEncrypt(m *Message, b []byte) ([]byte, error) {
 	}
 
 	isAsymmetric := m.MessageHeader.AsymmetricSecurityHeader != nil
+	algo := c.algo
+	if !isAsymmetric && c.previousSend != nil && m.SymmetricSecurityHeader.TokenID == c.previousSend.id {
+		// Select by the header already chosen for this entire message, even
+		// if the peer switches tokens while a multi-chunk response is written.
+		algo = c.previousSend.algo
+	}
 
 	var headerLength int
 
@@ -209,8 +234,8 @@ func (c *channelInstance) signAndEncrypt(m *Message, b []byte) ([]byte, error) {
 
 	var encryptedLength int
 	if c.sc.cfg.SecurityMode == ua.MessageSecurityModeSignAndEncrypt || isAsymmetric {
-		plaintextBlockSize := c.algo.PlaintextBlockSize()
-		extraPadding := c.algo.RemoteSignatureLength() > 256
+		plaintextBlockSize := algo.PlaintextBlockSize()
+		extraPadding := algo.RemoteSignatureLength() > 256
 		paddingBytes := 1
 		if extraPadding {
 			paddingBytes = 2
@@ -219,7 +244,7 @@ func (c *channelInstance) signAndEncrypt(m *Message, b []byte) ([]byte, error) {
 		// block boundary. If it is already block-aligned no padding is needed
 		// beyond the PaddingSize byte(s) themselves (cf. open62541
 		// ua_securechannel_crypto.c, padding calculation).
-		remainder := (len(b[headerLength:]) + c.algo.SignatureLength() + paddingBytes) % plaintextBlockSize
+		remainder := (len(b[headerLength:]) + algo.SignatureLength() + paddingBytes) % plaintextBlockSize
 		paddingLength := 0
 		if remainder != 0 {
 			paddingLength = plaintextBlockSize - remainder
@@ -233,16 +258,16 @@ func (c *channelInstance) signAndEncrypt(m *Message, b []byte) ([]byte, error) {
 		if extraPadding {
 			b = append(b, byte(paddingLength>>8))
 		}
-		encryptedLength = ((len(b[headerLength:]) + c.algo.SignatureLength()) / plaintextBlockSize) * c.algo.BlockSize()
+		encryptedLength = ((len(b[headerLength:]) + algo.SignatureLength()) / plaintextBlockSize) * algo.BlockSize()
 	} else { // MessageSecurityModeSign
-		encryptedLength = len(b[headerLength:]) + c.algo.SignatureLength()
+		encryptedLength = len(b[headerLength:]) + algo.SignatureLength()
 	}
 
 	// Fix header size to account for signing / encryption
 	binary.LittleEndian.PutUint32(b[4:], uint32(headerLength+encryptedLength))
 	m.Header.MessageSize = uint32(headerLength + encryptedLength)
 
-	signature, err := c.algo.Signature(b)
+	signature, err := algo.Signature(b)
 	if err != nil {
 		return nil, ua.StatusBadSecurityChecksFailed
 	}
@@ -250,7 +275,7 @@ func (c *channelInstance) signAndEncrypt(m *Message, b []byte) ([]byte, error) {
 	b = append(b, signature...)
 	p := b[headerLength:]
 	if c.sc.cfg.SecurityMode == ua.MessageSecurityModeSignAndEncrypt || isAsymmetric {
-		p, err = c.algo.Encrypt(p)
+		p, err = algo.Encrypt(p)
 		if err != nil {
 			return nil, ua.StatusBadSecurityChecksFailed
 		}
@@ -267,7 +292,12 @@ func (c *channelInstance) signAndEncrypt(m *Message, b []byte) ([]byte, error) {
 // policy, or any symmetric message regardless of policy. This carve-out is the
 // replacement for the readChunk SecurityMode override (added in #817); that
 // override is no longer present and this guard takes its place.
-func (c *channelInstance) verifyAndDecrypt(m *MessageChunk, r []byte) ([]byte, error) {
+func (c *channelInstance) verifyAndDecrypt(m *MessageChunk, r []byte) (plain []byte, err error) {
+	defer func() {
+		if err == nil && c.sc.kind == server && m.SymmetricSecurityHeader != nil && m.SymmetricSecurityHeader.TokenID == c.securityTokenID {
+			c.waitingForPeer.Store(false)
+		}
+	}()
 	isAsymmetric := m.AsymmetricSecurityHeader != nil
 
 	// Return raw only for a genuinely unsecured chunk; an asymmetric OPN under a
