@@ -68,6 +68,8 @@ type channelBroker struct {
 	// get funneled into for handling
 	msgChan              chan *uasc.MessageBody
 	logger               Logger
+	onClosed             func(uint32)
+	onRegistered         func(uint32)
 	responseWriteTimeout time.Duration
 	// certValidator vets a client application certificate on OpenSecureChannel.
 	certValidator func(cert []byte) error
@@ -181,6 +183,9 @@ func (c *channelBroker) RegisterConn(ctx context.Context, conn *uacp.Conn, local
 	channelCount := len(c.s)
 	c.wg.Add(1)
 	c.mu.Unlock()
+	if c.onRegistered != nil {
+		c.onRegistered(secureChannelID)
+	}
 	defer c.wg.Done()
 	// Logger callbacks are external code and must not run under the broker lock.
 	emitDiagInfo(c.logger, diagPayload{
@@ -248,6 +253,9 @@ outer:
 	delete(c.s, secureChannelID)
 	remainingChannels := len(c.s)
 	c.mu.Unlock()
+	if c.onClosed != nil {
+		c.onClosed(secureChannelID)
+	}
 	emitDiagInfo(c.logger, diagPayload{
 		Event:           "channel_closed",
 		SecureChannelID: secureChannelID,

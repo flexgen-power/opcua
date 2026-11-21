@@ -2,6 +2,12 @@ package server
 
 import "github.com/gopcua/opcua/ua"
 
+func (s *Server) SessionCount() int {
+	s.sb.mu.Lock()
+	defer s.sb.mu.Unlock()
+	return len(s.sb.s)
+}
+
 // ActivatedSessionTokens returns the authentication tokens of the sessions that
 // have been activated. A test uses one to act as a peer that has somehow
 // learned another client's token, which is the situation channel binding is
