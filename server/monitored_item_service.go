@@ -35,8 +35,13 @@ type MonitoredItemService struct {
 	// it after one that read a newer value, leaving the stale value as "latest" in
 	// a subscriber's publish queue. Never acquire Mu while holding one of these --
 	// lock ordering here is always nodeLocks entry, then (separately, inside
-	// collectNotifications) Mu, never the reverse. The only lock taken while a
-	// node lock is held is a subscription's leaf pendingMu.
+	// collectNotifications) Mu, never the reverse. Apart from whatever the
+	// namespace's attribute read and the logger take, the only locks taken while
+	// a node lock is held are the monitored item's sampleMu (in sampleReady) and
+	// then a subscription's leaf pendingMu (in Notify), one after the other.
+	// Neither is held while acquiring Mu or a node lock; DeleteMonitoredItem
+	// takes sampleMu under Mu. Deferred samples are delivered by deliverSample on
+	// timer goroutines and follow the same order.
 	nodeLocks sync.Map // map[string]*sync.Mutex
 }
 
