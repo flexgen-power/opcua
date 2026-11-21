@@ -167,3 +167,23 @@ func TestRenewalWaitsForSlowSwitchingClient(t *testing.T) {
 		})
 	}
 }
+
+// A client may renew after its token's lifetime plus 25% has passed. A
+// request it sent under the old token before it saw the renewal response
+// must still verify, or the server drops the channel at the renewal.
+func TestLateRenewalAcceptsRequestsUnderTheOldToken(t *testing.T) {
+	p := newRenewalPair(t, ua.MessageSecurityModeSignAndEncrypt)
+	p.read(t, nil)
+
+	// Back-date the server's token to twice its lifetime ago.
+	inst := p.serverInstance(t)
+	inst.Lock()
+	inst.createdAt = inst.createdAt.Add(-2 * time.Hour)
+	inst.Unlock()
+
+	old, err := p.cli.getActiveChannelInstance()
+	require.NoError(t, err)
+	require.NoError(t, p.cli.Renew(p.ctx))
+	p.read(t, old)
+	p.read(t, nil)
+}

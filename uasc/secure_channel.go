@@ -971,11 +971,16 @@ func (s *SecureChannel) handleOpenSecureChannelRequest(reqID uint32, svc ua.Requ
 		}
 		if renewal {
 			// Requests the client sent before it saw this response are
-			// still secured with the old token. Keep its keys for the rest
-			// of its lifetime so they verify.
+			// still secured with the old token. Keep its keys until the
+			// token's lifetime plus 25% has passed, and for at least a
+			// quarter lifetime after this renewal, so requests in flight
+			// across a late renewal still verify.
 			instance.prevAlgo = prev
 			instance.prevTokenID = instance.securityTokenID
 			instance.prevExpires = oldExpires.Add(prevLifetime / 4)
+			if floor := time.Now().Add(prevLifetime / 4); instance.prevExpires.Before(floor) {
+				instance.prevExpires = floor
+			}
 			instance.previousSend = outgoing
 			instance.waitingForPeer.Store(true)
 		}
