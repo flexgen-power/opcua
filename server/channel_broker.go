@@ -94,7 +94,8 @@ type channelBroker struct {
 	// dispatcher has not finished with: those waiting to be handed off and
 	// the one being handled, which is also in handling. Session expiry must
 	// not run ahead of them, or a dispatcher stall would close sessions whose
-	// requests arrived in time.
+	// requests arrived in time. A request still unread in a socket is not
+	// among them; see stampReceived.
 	unhandledMu sync.Mutex
 	unhandled   map[*inboundMessage]struct{}
 	handling    *inboundMessage
@@ -119,6 +120,14 @@ func newChannelBroker(logger Logger, responseWriteTimeout, dispatchTimeout time.
 // stampReceived stamps msg with the time it was received and records it as
 // unhandled. The stamp is taken under the lock that oldestUnhandled takes, so
 // a message it does not see was received after it looked.
+//
+// A channel's reader reads one message at a time and reads the next only once
+// the dispatcher has taken this one, so while the dispatcher is stalled only
+// the first message a channel sends during the stall is stamped when it
+// arrives. A request still unread in the socket behind it is stamped when the
+// reader gets to it. A client that pipelines requests across a stall longer
+// than its session timeout can therefore still have its session closed as
+// idle, although it sent the requests in time.
 func (c *channelBroker) stampReceived(msg *uasc.MessageBody) *inboundMessage {
 	c.unhandledMu.Lock()
 	defer c.unhandledMu.Unlock()
