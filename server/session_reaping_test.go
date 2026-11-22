@@ -183,3 +183,52 @@ func TestReapedSessionAbortsHeldPublishRequests(t *testing.T) {
 	require.Less(t, time.Since(start), 2*time.Second, "held Publish requests were answered only by the client's timeout")
 	require.Equal(t, 0, ss.srv.SessionCount())
 }
+
+// A request counts toward its session from when the server received it, not
+// from when the single request dispatcher got to it. A client that sent a
+// request within its session timeout keeps its session while the dispatcher
+// spends longer than that timeout on another client's request.
+func TestDispatcherStallKeepsSessionWithQueuedRequest(t *testing.T) {
+	ss := startSecureServer(t, server.EnableSecurity("None", ua.MessageSecurityModeNone), server.EnableAuthMode(ua.UserTokenTypeAnonymous))
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	activated := func(timeout time.Duration) *opcua.Client {
+		c, err := opcua.NewClient(ss.addr, opcua.SecurityMode(ua.MessageSecurityModeNone), opcua.AutoReconnect(false))
+		require.NoError(t, err)
+		require.NoError(t, c.Dial(ctx))
+		t.Cleanup(func() { c.Close(context.Background()) })
+		cfg := opcua.DefaultSessionConfig()
+		cfg.SessionTimeout = timeout
+		sess, err := c.CreateSession(ctx, cfg)
+		require.NoError(t, err)
+		require.NoError(t, c.ActivateSession(ctx, sess))
+		return c
+	}
+	read := &ua.ReadRequest{NodesToRead: []*ua.ReadValueID{{NodeID: ss.node.ID(), AttributeID: ua.AttributeIDValue}}}
+	const timeout = time.Second
+	busy := activated(time.Minute)
+	c := activated(timeout)
+	_, err := c.Read(ctx, read)
+	require.NoError(t, err)
+	stallStart := time.Now()
+
+	// CreateSubscription waits for this lock, and the dispatcher waits with it.
+	ss.srv.SubscriptionService.Mu.Lock()
+	stalled := make(chan error, 1)
+	go func() {
+		stalled <- busy.Send(ctx, &ua.CreateSubscriptionRequest{
+			RequestedPublishingInterval: 100, RequestedLifetimeCount: 1000, RequestedMaxKeepAliveCount: 10,
+		}, func(ua.Response) error { return nil })
+	}()
+	time.Sleep(100 * time.Millisecond)
+	queued := make(chan error, 1)
+	go func() {
+		_, err := c.Read(ctx, read)
+		queued <- err
+	}()
+	time.Sleep(2*timeout - time.Since(stallStart))
+	ss.srv.SubscriptionService.Mu.Unlock()
+
+	require.NoError(t, <-stalled)
+	require.NoError(t, <-queued, "a request received within the session timeout found its session closed")
+}

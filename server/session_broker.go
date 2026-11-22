@@ -37,7 +37,9 @@ type session struct {
 	identity  string
 
 	PublishRequests chan PubReq
-	// lastActivity is guarded by the broker mutex; it retains the monotonic clock.
+	// lastActivity is guarded by the broker mutex; it retains the monotonic
+	// clock. It is when the session was created or, once a request has been
+	// accepted for it, when the latest such request was received.
 	lastActivity time.Time
 }
 
@@ -146,6 +148,8 @@ func (sb *sessionBroker) expired(now time.Time) []*session {
 
 // touch checks expiry and records only a request accepted for this session.
 // An expired or concurrently removed session cannot be resurrected by traffic.
+// now is when the request was received; requests on different channels can be
+// handled out of that order, so the idle clock never moves back.
 func (sb *sessionBroker) touch(s *session, now time.Time) (bool, *session) {
 	sb.mu.Lock()
 	defer sb.mu.Unlock()
@@ -157,7 +161,9 @@ func (sb *sessionBroker) touch(s *session, now time.Time) (bool, *session) {
 		delete(sb.s, key)
 		return false, s
 	}
-	s.lastActivity = now
+	if now.After(s.lastActivity) {
+		s.lastActivity = now
+	}
 	return true, nil
 }
 

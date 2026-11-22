@@ -128,6 +128,9 @@ func TestRegisterConnClosesChannelWhenDispatcherStalls(t *testing.T) {
 	if n := channelCount(cb); n != 0 {
 		t.Fatalf("channel map has %d entries after dispatch timeout, want 0", n)
 	}
+	if _, ok := cb.oldestUnhandled(); ok {
+		t.Fatal("a message the dispatcher never took still holds back session expiry")
+	}
 	if !logger.contains(`"event":"channel_dispatch_timeout"`) {
 		t.Fatal("no channel_dispatch_timeout diagnostic was logged")
 	}
@@ -170,6 +173,9 @@ func TestRegisterConnKeepsChannelWhileDispatcherCatchesUp(t *testing.T) {
 			}
 			if n := channelCount(cb); n != 1 {
 				t.Fatalf("channel map has %d entries while dispatcher is slow, want 1", n)
+			}
+			if _, ok := cb.oldestUnhandled(); !ok {
+				t.Fatal("a message waiting for the dispatcher does not hold back session expiry")
 			}
 
 			readCtx, readCancel := context.WithTimeout(ctx, 5*time.Second)

@@ -43,6 +43,11 @@ func TestSessionBrokerIdleTimeoutAndTouch(t *testing.T) {
 	if ok, _ := sb.touch(sess, start.Add(500*time.Millisecond)); !ok {
 		t.Fatal("live session rejected")
 	}
+	// A request received earlier but handled later does not move the idle
+	// clock back.
+	if ok, _ := sb.touch(sess, start.Add(100*time.Millisecond)); !ok {
+		t.Fatal("live session rejected")
+	}
 	if expired := sb.expired(start.Add(1200 * time.Millisecond)); len(expired) != 0 {
 		t.Fatal("traffic did not extend the idle timeout")
 	}

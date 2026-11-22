@@ -44,6 +44,11 @@ type Server struct {
 	sessionsStop     chan struct{}
 	sessionsStopOnce sync.Once
 
+	// requestReceived is when the request the dispatcher is handling was
+	// received. A session's idle time counts from it. Only the dispatcher
+	// goroutine uses it.
+	requestReceived time.Time
+
 	// nextSecureChannelID uint32
 
 	// Service Handlers are methods called to respond to service requests from clients
@@ -347,7 +352,7 @@ func abortPublishRequests(sess *session) {
 }
 
 func (s *Server) touchSession(sess *session) bool {
-	ok, expired := s.sb.touch(sess, time.Now())
+	ok, expired := s.sb.touch(sess, s.requestReceived)
 	if expired != nil {
 		s.closeExpiredSessions([]*session{expired})
 	}
@@ -364,6 +369,12 @@ func (s *Server) monitorSessions(ctx context.Context) {
 		case <-s.sessionsStop:
 			return
 		case now := <-ticker.C:
+			// A request the dispatcher has not finished with may be the one
+			// that keeps a session alive, so expire sessions only as of when
+			// the oldest such request was received.
+			if oldest, ok := s.cb.oldestUnhandled(); ok && oldest.Before(now) {
+				now = oldest
+			}
 			s.closeExpiredSessions(s.sb.expired(now))
 		}
 	}
@@ -457,6 +468,7 @@ func (s *Server) monitorConnections(ctx context.Context) {
 		}
 
 		// todo: should this be delegated to another goroutine in case handling this hangs?
+		s.requestReceived = msg.received
 		s.handleService(ctx, sc, msg.RequestID, msg.Request())
 	}
 }

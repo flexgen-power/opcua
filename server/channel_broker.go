@@ -48,6 +48,13 @@ func (c *channelBroker) receive(ctx context.Context, recv func(context.Context) 
 	return recv(ctx)
 }
 
+// inboundMessage is a message from a secure channel and the time its reader
+// received it, before it waited for the request dispatcher.
+type inboundMessage struct {
+	*uasc.MessageBody
+	received time.Time
+}
+
 type channelBroker struct {
 	endpoints map[string]*ua.EndpointDescription
 
@@ -66,7 +73,7 @@ type channelBroker struct {
 
 	// msgChan is the common channel that all messages from all channels
 	// get funneled into for handling
-	msgChan              chan *uasc.MessageBody
+	msgChan              chan *inboundMessage
 	logger               Logger
 	onClosed             func(uint32)
 	onRegistered         func(uint32)
@@ -82,6 +89,15 @@ type channelBroker struct {
 	// progress on the monotonic clock.
 	epoch      time.Time
 	lastAccept atomic.Int64
+
+	// unhandled holds every message a reader has received that the
+	// dispatcher has not finished with: those waiting to be handed off and
+	// the one being handled, which is also in handling. Session expiry must
+	// not run ahead of them, or a dispatcher stall would close sessions whose
+	// requests arrived in time.
+	unhandledMu sync.Mutex
+	unhandled   map[*inboundMessage]struct{}
+	handling    *inboundMessage
 }
 
 func newChannelBroker(logger Logger, responseWriteTimeout, dispatchTimeout time.Duration) *channelBroker {
@@ -89,14 +105,47 @@ func newChannelBroker(logger Logger, responseWriteTimeout, dispatchTimeout time.
 	return &channelBroker{
 		endpoints:            make(map[string]*ua.EndpointDescription),
 		s:                    make(map[uint32]*uasc.SecureChannel),
-		msgChan:              make(chan *uasc.MessageBody),
+		msgChan:              make(chan *inboundMessage),
 		secureChannelID:      uint32(rng.Int31()),
 		secureTokenID:        uint32(rng.Int31()),
 		logger:               logger,
 		responseWriteTimeout: responseWriteTimeout,
 		dispatchTimeout:      dispatchTimeout,
 		epoch:                time.Now(),
+		unhandled:            make(map[*inboundMessage]struct{}),
 	}
+}
+
+// stampReceived stamps msg with the time it was received and records it as
+// unhandled. The stamp is taken under the lock that oldestUnhandled takes, so
+// a message it does not see was received after it looked.
+func (c *channelBroker) stampReceived(msg *uasc.MessageBody) *inboundMessage {
+	c.unhandledMu.Lock()
+	defer c.unhandledMu.Unlock()
+	m := &inboundMessage{MessageBody: msg, received: time.Now()}
+	c.unhandled[m] = struct{}{}
+	return m
+}
+
+// handled records that nothing will handle m any more.
+func (c *channelBroker) handled(m *inboundMessage) {
+	c.unhandledMu.Lock()
+	defer c.unhandledMu.Unlock()
+	delete(c.unhandled, m)
+}
+
+// oldestUnhandled returns when the oldest message the dispatcher has not
+// finished with was received, and false when there is none.
+func (c *channelBroker) oldestUnhandled() (time.Time, bool) {
+	c.unhandledMu.Lock()
+	defer c.unhandledMu.Unlock()
+	var oldest time.Time
+	for m := range c.unhandled {
+		if oldest.IsZero() || m.received.Before(oldest) {
+			oldest = m.received
+		}
+	}
+	return oldest, !oldest.IsZero()
 }
 
 // dispatch hands msg to the server's request dispatcher. It reports
@@ -107,7 +156,7 @@ func newChannelBroker(logger Logger, responseWriteTimeout, dispatchTimeout time.
 // long the dispatcher has gone without accepting any message rather than how
 // long this reader has waited; a busy dispatcher draining a backlog must not
 // drop connections.
-func (c *channelBroker) dispatch(ctx context.Context, msg *uasc.MessageBody) string {
+func (c *channelBroker) dispatch(ctx context.Context, msg *inboundMessage) string {
 	if c.dispatchTimeout <= 0 {
 		select {
 		case c.msgChan <- msg:
@@ -228,7 +277,9 @@ outer:
 				sc.Close()
 				break outer
 			}
-			if cause := c.dispatch(ctx, msg); cause != "" {
+			m := c.stampReceived(msg)
+			if cause := c.dispatch(ctx, m); cause != "" {
+				c.handled(m)
 				closeCause = cause
 				if cause == "dispatch_timeout" {
 					closeErr = fmt.Sprintf("request dispatcher accepted no messages for %s", c.dispatchTimeout)
@@ -305,12 +356,24 @@ func (c *channelBroker) Close() error {
 	return err
 }
 
-func (c *channelBroker) ReadMessage(ctx context.Context) *uasc.MessageBody {
+// ReadMessage returns the next message for the dispatcher. The dispatcher
+// handles one message at a time, so asking for the next one means it has
+// finished with the one returned before.
+func (c *channelBroker) ReadMessage(ctx context.Context) *inboundMessage {
+	c.unhandledMu.Lock()
+	if c.handling != nil {
+		delete(c.unhandled, c.handling)
+		c.handling = nil
+	}
+	c.unhandledMu.Unlock()
 	select {
 	case <-ctx.Done():
 		return nil
 	case msg := <-c.msgChan:
 		c.lastAccept.Store(int64(c.sinceEpoch()))
+		c.unhandledMu.Lock()
+		c.handling = msg
+		c.unhandledMu.Unlock()
 		return msg
 	}
 }
