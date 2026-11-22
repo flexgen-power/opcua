@@ -333,3 +333,45 @@ func TestCreateMonitoredItemsHonorsServerMinimumSamplingInterval(t *testing.T) {
 		}
 	}
 }
+
+// A negative, NaN or infinite server MinimumSamplingInterval counts as zero, so
+// a node's own floor still applies.
+func TestServerMinimumSamplingIntervalIgnoresInvalidValues(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		ms   float64
+	}{
+		{"negative", -1},
+		{"nan", math.NaN()},
+		{"infinity", math.Inf(1)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := New(MinimumSamplingInterval(tc.ms))
+			srv.initHandlers()
+			sess := srv.sb.NewSession()
+			subID := createTestSubscription(t, srv, sess)
+			ns := NewNodeNameSpace(srv, "sampling")
+			node := NewVariableNode(ua.NewStringNodeID(ns.ID(), "floor"), "floor", int32(0))
+			if err := node.SetAttribute(ua.AttributeIDMinimumSamplingInterval, DataValueFromValue(2000.0)); err != nil {
+				t.Fatalf("SetAttribute: %v", err)
+			}
+			ns.AddNode(node)
+			resp, err := srv.MonitoredItemService.CreateMonitoredItems(nil, &ua.CreateMonitoredItemsRequest{
+				RequestHeader:  &ua.RequestHeader{AuthenticationToken: sess.AuthTokenID},
+				SubscriptionID: subID,
+				ItemsToCreate: []*ua.MonitoredItemCreateRequest{{
+					ItemToMonitor:       &ua.ReadValueID{NodeID: node.ID(), AttributeID: ua.AttributeIDValue},
+					MonitoringMode:      ua.MonitoringModeReporting,
+					RequestedParameters: &ua.MonitoringParameters{ClientHandle: 1, SamplingInterval: 100},
+				}},
+			}, 0)
+			if err != nil {
+				t.Fatalf("CreateMonitoredItems: %v", err)
+			}
+			r := resp.(*ua.CreateMonitoredItemsResponse).Results[0]
+			if r.StatusCode != ua.StatusOK || r.RevisedSamplingInterval != 2000 {
+				t.Fatalf("result %+v, want StatusOK with revised interval 2000", r)
+			}
+		})
+	}
+}
