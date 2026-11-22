@@ -125,15 +125,20 @@ func (sb *sessionBroker) removeMatching(match func(*session) bool) []*session {
 	return removed
 }
 
-func (sb *sessionBroker) closeUnactivated(channel uint32) {
+// closeUnactivated forgets a closed channel and removes the sessions created on
+// it that were never activated, returning them.
+func (sb *sessionBroker) closeUnactivated(channel uint32) []*session {
 	sb.mu.Lock()
 	defer sb.mu.Unlock()
 	delete(sb.channels, channel)
+	var removed []*session
 	for token, s := range sb.s {
 		if s.createChannelID == channel && !s.activated.Load() {
 			delete(sb.s, token)
+			removed = append(removed, s)
 		}
 	}
+	return removed
 }
 
 func (sb *sessionBroker) channelOpened(channel uint32) {

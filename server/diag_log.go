@@ -14,6 +14,7 @@ type diagPayload struct {
 	RequestID            uint32 `json:"request_id,omitempty"`
 	SecureChannelID      uint32 `json:"secure_channel_id,omitempty"`
 	RemoteAddr           string `json:"remote_addr,omitempty"`
+	SessionID            string `json:"session_id,omitempty"`
 	EndpointURL          string `json:"endpoint_url,omitempty"`
 	MatchedEndpointCount *int   `json:"matched_endpoint_count,omitempty"`
 	DurationMs           *int64 `json:"duration_ms,omitempty"`

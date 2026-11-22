@@ -2,6 +2,7 @@ package server_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -231,4 +232,57 @@ func TestDispatcherStallKeepsSessionWithQueuedRequest(t *testing.T) {
 
 	require.NoError(t, <-stalled)
 	require.NoError(t, <-queued, "a request received within the session timeout found its session closed")
+}
+
+// A session the server closes on its own is reported with a session_expired
+// diagnostic and a log line saying why, so a later request with its token can
+// be told apart from one with a token the server never issued.
+func TestExpiredSessionsAreReported(t *testing.T) {
+	log := &captureLogger{}
+	ss := startSecureServer(t, server.SetLogger(log), server.EnableSecurity("None", ua.MessageSecurityModeNone), server.EnableAuthMode(ua.UserTokenTypeAnonymous))
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	createSession := func(timeout float64) (*opcua.Client, string) {
+		c, err := opcua.NewClient(ss.addr, opcua.SecurityMode(ua.MessageSecurityModeNone), opcua.AutoReconnect(false))
+		require.NoError(t, err)
+		require.NoError(t, c.Dial(ctx))
+		t.Cleanup(func() { c.Close(context.Background()) })
+		r, err := sendFor(ctx, c.SecureChannel(), &ua.CreateSessionRequest{
+			ClientDescription:       &ua.ApplicationDescription{ApplicationType: ua.ApplicationTypeClient, ApplicationName: &ua.LocalizedText{}},
+			EndpointURL:             ss.addr,
+			SessionName:             "expiry",
+			ClientNonce:             make([]byte, 32),
+			RequestedSessionTimeout: timeout,
+		}, nil, 5*time.Second)
+		require.NoError(t, err)
+		return c, r.(*ua.CreateSessionResponse).SessionID.String()
+	}
+	logged := func(subs ...string) bool {
+		log.mu.Lock()
+		defer log.mu.Unlock()
+		for _, line := range log.lines {
+			found := true
+			for _, sub := range subs {
+				found = found && strings.Contains(line, sub)
+			}
+			if found {
+				return true
+			}
+		}
+		return false
+	}
+	requireReported := func(id, cause string) {
+		t.Helper()
+		require.Eventually(t, func() bool {
+			return logged(`"event":"session_expired"`, `"session_id":"`+id+`"`, `"close_cause":"`+cause+`"`)
+		}, 3*time.Second, 10*time.Millisecond, "no session_expired diagnostic for %s with close_cause %s", id, cause)
+		require.True(t, logged("INFO session expired: id="+id+" cause="+cause), "no log line for session %s", id)
+	}
+
+	_, idle := createSession(300)
+	requireReported(idle, "idle_timeout")
+
+	c, abandoned := createSession(60000)
+	require.NoError(t, c.Close(ctx))
+	requireReported(abandoned, "channel_closed_unactivated")
 }

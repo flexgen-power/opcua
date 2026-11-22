@@ -294,7 +294,9 @@ func (s *Server) Start(ctx context.Context) error {
 		s.cb.certValidator = s.cfg.clientCertValidator
 	}
 
-	s.cb.onClosed = s.sb.closeUnactivated
+	s.cb.onClosed = func(channel uint32) {
+		s.reportExpiredSessions(s.sb.closeUnactivated(channel), "channel_closed_unactivated")
+	}
 	s.cb.onRegistered = s.sb.channelOpened
 	go s.acceptAndRegister(ctx, s.l)
 	go s.monitorConnections(ctx)
@@ -351,9 +353,35 @@ func abortPublishRequests(sess *session) {
 	}
 }
 
+// reportExpiredSessions logs each session the server closed on its own, with a
+// session_expired diagnostic whose close_cause says why: "idle_timeout" for a
+// session that had no request accepted within its timeout, and
+// "channel_closed_unactivated" for one whose secure channel closed before it
+// was activated. A later request with one of their tokens fails its session
+// lookup just like a token the server never issued, and this is what tells
+// the two apart. Server.Close ends sessions without reporting them.
+func (s *Server) reportExpiredSessions(sessions []*session, cause string) {
+	for _, sess := range sessions {
+		channel := sess.createChannelID
+		if sess.activated.Load() {
+			channel = sess.channelID.Load()
+		}
+		emitDiagInfo(s.cfg.logger, diagPayload{
+			Event:           "session_expired",
+			SecureChannelID: channel,
+			SessionID:       sess.ID.String(),
+			CloseCause:      cause,
+		})
+		if s.cfg.logger != nil {
+			s.cfg.logger.Info("session expired: id=%s cause=%s channel=%d timeout=%s", sess.ID, cause, channel, sess.cfg.sessionTimeout)
+		}
+	}
+}
+
 func (s *Server) touchSession(sess *session) bool {
 	ok, expired := s.sb.touch(sess, s.requestReceived)
 	if expired != nil {
+		s.reportExpiredSessions([]*session{expired}, "idle_timeout")
 		s.closeExpiredSessions([]*session{expired})
 	}
 	return ok
@@ -375,7 +403,9 @@ func (s *Server) monitorSessions(ctx context.Context) {
 			if oldest, ok := s.cb.oldestUnhandled(); ok && oldest.Before(now) {
 				now = oldest
 			}
-			s.closeExpiredSessions(s.sb.expired(now))
+			expired := s.sb.expired(now)
+			s.reportExpiredSessions(expired, "idle_timeout")
+			s.closeExpiredSessions(expired)
 		}
 	}
 }
