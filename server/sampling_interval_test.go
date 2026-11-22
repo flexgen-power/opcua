@@ -2,6 +2,7 @@ package server
 
 import (
 	"math"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -125,30 +126,66 @@ func TestSamplingRetainsFinalUpdateAcrossConsecutiveWindows(t *testing.T) {
 // Namespaces are written by the application on its own goroutines, without any
 // lock the server holds, and a sampling timer fires while those writes go on. A
 // deferred sample must therefore deliver the value read when the change was
-// reported rather than read the node again on the timer's goroutine. Both tests
-// below write a monitored node faster than its sampling interval; run them with
-// -race.
-func TestDeferredSamplesDoNotReadNodeNameSpaceOnTimer(t *testing.T) {
+// reported rather than read the node again on the timer's goroutine.
+//
+// appLockedNameSpace stands for an application that writes its nodes and
+// reports their changes while holding mu, as MapNamespace.SetValue does with
+// its Mu. Attribute counts the calls made while mu is free: the reporting
+// goroutine holds it, so those can only come from another goroutine.
+type appLockedNameSpace struct {
+	*NodeNameSpace
+	mu            sync.Mutex
+	unlockedReads atomic.Int32
+}
+
+func (ns *appLockedNameSpace) Attribute(id *ua.NodeID, attr ua.AttributeID) *ua.DataValue {
+	if ns.mu.TryLock() {
+		ns.mu.Unlock()
+		ns.unlockedReads.Add(1)
+	}
+	return ns.NodeNameSpace.Attribute(id, attr)
+}
+
+// The final value of a burst arrives through the sampling timer without the
+// namespace being read outside the reporting goroutine. This does not depend
+// on the race detector, since Node's own lock makes such a read race-free.
+func TestDeferredSamplesDoNotReadNameSpaceOnTimer(t *testing.T) {
 	srv := New()
 	srv.initHandlers()
-	ns := NewNodeNameSpace(srv, "sampling")
+	ns := &appLockedNameSpace{NodeNameSpace: NewNameSpace("sampling")}
+	srv.AddNamespace(ns)
 	node := ns.AddNode(NewVariableNode(ua.NewStringNodeID(ns.ID(), "value"), "value", int32(0)))
 	sub := NewSubscription()
 	monitorNode(srv, sub, 1, node.ID(), 42)
 	item := srv.MonitoredItemService.Nodes[node.ID().String()][0]
-	item.sampleInterval = time.Millisecond
+	item.sampleInterval = 100 * time.Millisecond
 	t.Cleanup(item.stopSampling)
 
-	var last int32
-	for start := time.Now(); time.Since(start) < 300*time.Millisecond; {
-		last++
-		if got := ns.SetAttribute(node.ID(), ua.AttributeIDValue, DataValueFromValue(last)); got != ua.StatusOK {
-			t.Fatalf("SetAttribute = %v", got)
+	write := func(v int32) {
+		ns.mu.Lock()
+		defer ns.mu.Unlock()
+		if err := node.SetAttribute(ua.AttributeIDValue, DataValueFromValue(v)); err != nil {
+			t.Fatalf("SetAttribute: %v", err)
 		}
+		srv.ChangeNotification(node.ID())
 	}
-	waitForPendingValue(t, sub, 42, last)
+	// The first change opens a sampling window and the rest land inside it.
+	write(0)
+	sub.drainPending(make(map[uint32]*ua.MonitoredItemNotification))
+	for v := int32(1); v <= 10; v++ {
+		write(v)
+	}
+	if got := sub.PendingNotifications(); got != 0 {
+		t.Fatalf("%d notifications before the sampling interval", got)
+	}
+	waitForPendingValue(t, sub, 42, 10)
+	if got := ns.unlockedReads.Load(); got != 0 {
+		t.Fatalf("the namespace was read %d times outside the reporting goroutine", got)
+	}
 }
 
+// MapNamespace reads its Data map without a lock, so a read on the timer's
+// goroutine races SetValue. Run this with -race.
 func TestDeferredSamplesDoNotReadMapNamespaceOnTimer(t *testing.T) {
 	srv := New()
 	srv.initHandlers()
