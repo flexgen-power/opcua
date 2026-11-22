@@ -13,10 +13,12 @@ import (
 	"github.com/gopcua/opcua/ua"
 )
 
-// A requested session timeout in range is honoured in whole milliseconds and
-// anything else gets the 60 s default. A request too large for a
-// time.Duration used to wrap into range, so 18446744074710 ms became a
-// session the reaper closed after about a second.
+// A requested session timeout is honoured in whole milliseconds and clamped to
+// the allowed range, and one that is zero, negative or NaN gets the 60 s
+// default. A request above the range used to get the default, so a client that
+// asked for two hours and ignored the revised value was closed after a minute
+// idle. A request too large for a time.Duration used to wrap into range, so
+// 18446744074710 ms became a session the reaper closed after about a second.
 func TestCreateSessionRevisesTheRequestedTimeout(t *testing.T) {
 	ss := startSecureServer(t,
 		server.EnableSecurity("None", ua.MessageSecurityModeNone),
@@ -30,7 +32,11 @@ func TestCreateSessionRevisesTheRequestedTimeout(t *testing.T) {
 	require.NoError(t, c.Dial(ctx))
 	defer c.Close(ctx)
 
-	const def = 60000
+	const (
+		def   = 60000
+		lower = 100
+		upper = 3600000
+	)
 	for _, tc := range []struct {
 		name      string
 		requested float64
@@ -38,16 +44,19 @@ func TestCreateSessionRevisesTheRequestedTimeout(t *testing.T) {
 	}{
 		{"normal", 30000, 30000},
 		{"lower bound", 100, 100},
-		{"lower bound less a fraction", 99.9, def},
+		{"lower bound less a fraction", 99.9, lower},
+		{"below lower bound", 50, lower},
+		{"a fraction of a millisecond", 0.5, lower},
 		{"upper bound", 3600000, 3600000},
 		{"upper bound plus a fraction", 3600000.5, 3600000},
-		{"above upper bound", 3600001, def},
+		{"above upper bound", 3600001, upper},
+		{"two hours", 7200000, upper},
 		{"zero", 0, def},
 		{"negative", -1000, def},
 		{"NaN", math.NaN(), def},
-		{"+Inf", math.Inf(1), def},
+		{"+Inf", math.Inf(1), upper},
 		{"-Inf", math.Inf(-1), def},
-		{"wraps time.Duration", 18446744074710, def},
+		{"wraps time.Duration", 18446744074710, upper},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r, err := sendFor(ctx, c.SecureChannel(), &ua.CreateSessionRequest{

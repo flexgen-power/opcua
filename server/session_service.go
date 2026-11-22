@@ -53,12 +53,20 @@ func (s *SessionService) CreateSession(sc *uasc.SecureChannel, r ua.Request, req
 		return nil, ua.StatusBadSecurityChecksFailed
 	}
 
-	// Ensure session timeout is reasonable. Check the range on the whole
-	// milliseconds before converting: a huge request overflows
-	// time.Duration and can wrap into range, and NaN fails every comparison.
-	timeout := sessionTimeoutDefault
-	ms := math.Trunc(req.RequestedSessionTimeout)
-	if ms >= float64(sessionTimeoutMin/time.Millisecond) && ms <= float64(sessionTimeoutMax/time.Millisecond) {
+	// Honour the requested session timeout as closely as the allowed range
+	// permits (Part 4, 5.6.2): clamp a positive request into the range and
+	// give the default to one that is zero, negative or NaN. Clamp the whole
+	// milliseconds before converting: a huge request overflows time.Duration
+	// and can wrap into range, and NaN fails every comparison.
+	var timeout time.Duration
+	switch ms := math.Trunc(req.RequestedSessionTimeout); {
+	case !(req.RequestedSessionTimeout > 0):
+		timeout = sessionTimeoutDefault
+	case ms < float64(sessionTimeoutMin/time.Millisecond):
+		timeout = sessionTimeoutMin
+	case ms > float64(sessionTimeoutMax/time.Millisecond):
+		timeout = sessionTimeoutMax
+	default:
 		timeout = time.Duration(ms) * time.Millisecond
 	}
 
