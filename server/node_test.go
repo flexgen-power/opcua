@@ -86,3 +86,36 @@ func TestNamespaceAttributeMissingNodeClassReturnsBadAttributeIDInvalid(t *testi
 		require.Equal(t, ua.StatusBadAttributeIDInvalid, dv.Status)
 	})
 }
+
+// TestNodeAttributesAreSafeForConcurrentUse changes a node's attributes and
+// value while another goroutine reads them, as Read requests and subscription
+// deliveries do while the application updates a node. Run with -race.
+func TestNodeAttributesAreSafeForConcurrentUse(t *testing.T) {
+	ns := NewNameSpace("test")
+	nodeID := ua.NewStringNodeID(1, "x")
+	n := ns.AddNode(NewVariableNode(nodeID, "x", int32(0)))
+	access := DataValueFromValue(byte(ua.AccessLevelTypeCurrentRead | ua.AccessLevelTypeCurrentWrite))
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := int32(1); i <= 2000; i++ {
+			_ = n.SetAttribute(ua.AttributeIDAccessLevel, access)
+			_ = n.SetAttribute(ua.AttributeIDUserAccessLevel, access)
+			_ = n.SetAttribute(ua.AttributeIDValue, DataValueFromValue(i))
+			n.SetBrowseName("x")
+		}
+	}()
+	for running := true; running; {
+		select {
+		case <-done:
+			running = false
+		default:
+		}
+		require.Equal(t, ua.StatusOK, ns.Attribute(nodeID, ua.AttributeIDValue).Status)
+		require.NotNil(t, n.Value())
+		require.Equal(t, "x", n.BrowseName().Name)
+		require.NotNil(t, n.DataType())
+	}
+	require.Equal(t, int32(2000), n.Value().Value.Value())
+}

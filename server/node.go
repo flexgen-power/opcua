@@ -65,8 +65,12 @@ func DataValueFromValue(val any) *ua.DataValue {
 	}
 }
 
+// Attribute, Access, Value and SetAttribute may be called on a Node from any
+// goroutine: Read requests and subscription deliveries read a node on the
+// server's goroutines while the application changes it.
 type Node struct {
 	id     *ua.NodeID
+	attrMu sync.RWMutex // guards attr and val; never held while calling the value function
 	attr   Attributes
 	refsMu sync.RWMutex
 	refs   References
@@ -177,27 +181,40 @@ func (n *Node) ID() *ua.NodeID {
 }
 
 func (n *Node) Value() *ua.DataValue {
-	if n.val == nil {
+	vf := n.valueFunc()
+	if vf == nil {
 		return nil
 	}
-	return n.val()
+	return vf()
+}
+
+// valueFunc returns the value function, to be called without attrMu held.
+func (n *Node) valueFunc() ValueFunc {
+	n.attrMu.RLock()
+	defer n.attrMu.RUnlock()
+	return n.val
+}
+
+// storedAttr returns the stored value of an attribute other than Value.
+func (n *Node) storedAttr(id ua.AttributeID) *ua.DataValue {
+	n.attrMu.RLock()
+	defer n.attrMu.RUnlock()
+	return n.attr[id]
 }
 
 func (n *Node) Attribute(id ua.AttributeID) (*AttrValue, error) {
 	switch {
 	case id == ua.AttributeIDValue:
-		if n.val != nil {
-			val := n.val()
+		if vf := n.valueFunc(); vf != nil {
+			val := vf()
 			if val == nil {
 				return nil, ua.StatusBadAttributeIDInvalid
 			}
 			return NewAttrValue(val), nil
 		}
 		return nil, ua.StatusBadAttributeIDInvalid
-	case n.attr == nil:
-		return nil, ua.StatusBadAttributeIDInvalid
 	default:
-		if v := n.attr[id]; v != nil {
+		if v := n.storedAttr(id); v != nil {
 			return NewAttrValue(v), nil
 		}
 		return nil, ua.StatusBadAttributeIDInvalid
@@ -205,6 +222,8 @@ func (n *Node) Attribute(id ua.AttributeID) (*AttrValue, error) {
 }
 
 func (n *Node) SetAttribute(id ua.AttributeID, val *ua.DataValue) error {
+	n.attrMu.Lock()
+	defer n.attrMu.Unlock()
 
 	switch id {
 	case ua.AttributeIDValue:
@@ -222,7 +241,7 @@ func (n *Node) SetAttribute(id ua.AttributeID, val *ua.DataValue) error {
 }
 
 func (n *Node) BrowseName() *ua.QualifiedName {
-	v := n.attr[ua.AttributeIDBrowseName]
+	v := n.storedAttr(ua.AttributeIDBrowseName)
 	if v == nil || v.Value.Value() == nil {
 		return &ua.QualifiedName{}
 	}
@@ -230,11 +249,13 @@ func (n *Node) BrowseName() *ua.QualifiedName {
 }
 
 func (n *Node) SetBrowseName(s string) {
+	n.attrMu.Lock()
+	defer n.attrMu.Unlock()
 	n.attr[ua.AttributeIDBrowseName] = DataValueFromValue(&ua.QualifiedName{Name: s})
 }
 
 func (n *Node) DisplayName() *ua.LocalizedText {
-	v := n.attr[ua.AttributeIDDisplayName]
+	v := n.storedAttr(ua.AttributeIDDisplayName)
 	if v == nil || v.Value.Value() == nil {
 		return &ua.LocalizedText{}
 	}
@@ -246,11 +267,13 @@ func (n *Node) DisplayName() *ua.LocalizedText {
 func (n *Node) SetDisplayName(text, locale string) {
 	lt := &ua.LocalizedText{Text: text, Locale: locale}
 	lt.UpdateMask()
+	n.attrMu.Lock()
+	defer n.attrMu.Unlock()
 	n.attr[ua.AttributeIDDisplayName] = DataValueFromValue(lt)
 }
 
 func (n *Node) Description() *ua.LocalizedText {
-	v := n.attr[ua.AttributeIDDescription]
+	v := n.storedAttr(ua.AttributeIDDescription)
 	if v == nil || v.Value.Value() == nil {
 		return &ua.LocalizedText{}
 	}
@@ -258,6 +281,8 @@ func (n *Node) Description() *ua.LocalizedText {
 }
 
 func (n *Node) SetDescription(text, locale string) {
+	n.attrMu.Lock()
+	defer n.attrMu.Unlock()
 	n.attr[ua.AttributeIDDescription] = DataValueFromValue(&ua.LocalizedText{Text: text, Locale: locale})
 }
 
@@ -266,7 +291,7 @@ func (n *Node) DataType() *ua.ExpandedNodeID {
 		log.Printf("n was nil!")
 		return ua.NewTwoByteExpandedNodeID(0)
 	}
-	v := n.attr[ua.AttributeIDDataType]
+	v := n.storedAttr(ua.AttributeIDDataType)
 	if v == nil || v.Value.Value() == nil {
 		// if we have a type definition, return that?
 		for _, r := range n.referenceSnapshot() {
@@ -296,11 +321,13 @@ func (n *Node) DataType() *ua.ExpandedNodeID {
 }
 
 func (n *Node) SetNodeClass(nc ua.NodeClass) {
+	n.attrMu.Lock()
+	defer n.attrMu.Unlock()
 	n.attr[ua.AttributeIDNodeClass] = DataValueFromValue(uint32(nc))
 }
 
 func (n *Node) NodeClass() ua.NodeClass {
-	v := n.attr[ua.AttributeIDNodeClass]
+	v := n.storedAttr(ua.AttributeIDNodeClass)
 	if v == nil || v.Value.Value() == nil {
 		return ua.NodeClassObject
 	}
@@ -317,9 +344,10 @@ func (n *Node) NodeClass() ua.NodeClass {
 }
 
 func (n *Node) AddObject(o *Node) *Node {
+	attr, _ := o.attrSnapshot()
 	nn := &Node{
 		id:   o.id,
-		attr: maps.Clone(o.attr),
+		attr: attr,
 		refs: o.referenceSnapshot(),
 	}
 	if n.attr == nil {
@@ -331,11 +359,12 @@ func (n *Node) AddObject(o *Node) *Node {
 }
 
 func (n *Node) AddVariable(o *Node) *Node {
+	attr, val := o.attrSnapshot()
 	nn := &Node{
 		id:   o.id,
-		attr: maps.Clone(o.attr),
+		attr: attr,
 		refs: o.referenceSnapshot(),
-		val:  o.val,
+		val:  val,
 	}
 	if n.attr == nil {
 		n.attr = Attributes{}
@@ -372,6 +401,13 @@ func (n *Node) appendReference(ref *ua.ReferenceDescription) {
 	n.refsMu.Lock()
 	n.refs = append(n.refs, ref)
 	n.refsMu.Unlock()
+}
+
+// attrSnapshot copies the attribute map and returns the value function.
+func (n *Node) attrSnapshot() (Attributes, ValueFunc) {
+	n.attrMu.RLock()
+	defer n.attrMu.RUnlock()
+	return maps.Clone(n.attr), n.val
 }
 
 func (n *Node) referenceSnapshot() References {
