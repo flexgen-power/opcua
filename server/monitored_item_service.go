@@ -41,7 +41,7 @@ type MonitoredItemService struct {
 	// then a subscription's leaf pendingMu (in Notify), one after the other.
 	// Neither is held while acquiring Mu or a node lock; DeleteMonitoredItem
 	// takes sampleMu under Mu. Deferred samples are delivered by deliverSample on
-	// timer goroutines and follow the same order.
+	// timer goroutines and follow the same order, but never read the namespace.
 	nodeLocks sync.Map // map[string]*sync.Mutex
 }
 
@@ -202,28 +202,38 @@ func (s *MonitoredItemService) deliver(p pendingNotification) {
 	s.deliverSample(p, true)
 }
 
+// deliverSample reads the node only when called for a change, on the goroutine
+// that reported it. A sampling timer (changed false) delivers the value read
+// for the last change instead: the application writes its namespace without
+// any lock the server holds, and may report a change while still holding its
+// own (as MapNamespace.SetValue does), so a read on a timer's goroutine would
+// race those writes.
 func (s *MonitoredItemService) deliverSample(p pendingNotification, changed bool) {
 	lock := s.nodeLock(p.node.String())
 	lock.Lock()
 	defer lock.Unlock()
-	if p.item != nil && !p.item.sampleReady(s, p, changed) {
-		return
+	var value *ua.DataValue
+	if changed {
+		value = s.readValue(p)
+	}
+	if p.item != nil {
+		var ready bool
+		if value, ready = p.item.sampleReady(s, p, changed, value); !ready {
+			return
+		}
 	}
 
-	val := new(ua.MonitoredItemNotification)
-	val.ClientHandle = p.clientHandle
+	p.sub.Notify(&ua.MonitoredItemNotification{ClientHandle: p.clientHandle, Value: value})
+}
+
+func (s *MonitoredItemService) readValue(p pendingNotification) *ua.DataValue {
 	if p.ns.err != nil {
 		if s.SubService.srv.cfg.logger != nil {
 			s.SubService.srv.cfg.logger.Warn("error getting namespace %d: %v", p.node.Namespace(), p.ns.err)
 		}
-		val.Value = &ua.DataValue{}
-		val.Value.Status = ua.StatusBad
-		val.Value.EncodingMask |= ua.DataValueStatusCode
-	} else {
-		val.Value = p.ns.ns.Attribute(p.node, p.attributeID)
+		return &ua.DataValue{Status: ua.StatusBad, EncodingMask: ua.DataValueStatusCode}
 	}
-
-	p.sub.Notify(val)
+	return p.ns.ns.Attribute(p.node, p.attributeID)
 }
 
 // collectNotifications is the locked half of ChangeNotifications: it walks the
@@ -283,6 +293,7 @@ type MonitoredItem struct {
 	sampleInterval time.Duration
 	lastSample     time.Time
 	dirty          bool
+	latest         *ua.DataValue // value read for the last change; valid while dirty
 	deleted        bool
 	sampleTimer    *time.Timer
 }
@@ -297,32 +308,39 @@ func (item *MonitoredItem) stopSampling() {
 	}
 }
 
-// Keep at most one deferred sample per item. Its delivery re-reads the live
-// node, so a final update inside the interval is retained even if traffic stops.
-func (item *MonitoredItem) sampleReady(s *MonitoredItemService, p pendingNotification, changed bool) bool {
+// Keep at most one deferred sample per item: the value read for the last
+// change inside the interval. Its delivery hands on that value rather than
+// reading the node again, so a final update inside the interval is retained
+// even if traffic stops. sampleReady returns the value to deliver, if any.
+func (item *MonitoredItem) sampleReady(s *MonitoredItemService, p pendingNotification, changed bool, value *ua.DataValue) (*ua.DataValue, bool) {
 	item.sampleMu.Lock()
 	defer item.sampleMu.Unlock()
 	if item.deleted {
-		return false
+		return nil, false
 	}
-	item.dirty = item.dirty || changed
+	if changed {
+		item.dirty = true
+		item.latest = value
+	}
 	if !item.dirty {
-		return false
+		return nil, false
 	}
 	now := time.Now()
 	if wait := item.lastSample.Add(item.sampleInterval).Sub(now); wait > 0 {
 		if item.sampleTimer == nil {
 			item.sampleTimer = time.AfterFunc(wait, func() { s.deliverSample(p, false) })
 		}
-		return false
+		return nil, false
 	}
 	if item.sampleTimer != nil {
 		item.sampleTimer.Stop()
 		item.sampleTimer = nil
 	}
 	item.lastSample = now
+	value = item.latest
 	item.dirty = false
-	return true
+	item.latest = nil
+	return value, true
 }
 
 func reviseSamplingInterval(requested, publishing, minimum float64) float64 {

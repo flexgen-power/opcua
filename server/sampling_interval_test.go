@@ -122,6 +122,69 @@ func TestSamplingRetainsFinalUpdateAcrossConsecutiveWindows(t *testing.T) {
 	}
 }
 
+// Namespaces are written by the application on its own goroutines, without any
+// lock the server holds, and a sampling timer fires while those writes go on. A
+// deferred sample must therefore deliver the value read when the change was
+// reported rather than read the node again on the timer's goroutine. Both tests
+// below write a monitored node faster than its sampling interval; run them with
+// -race.
+func TestDeferredSamplesDoNotReadNodeNameSpaceOnTimer(t *testing.T) {
+	srv := New()
+	srv.initHandlers()
+	ns := NewNodeNameSpace(srv, "sampling")
+	node := ns.AddNode(NewVariableNode(ua.NewStringNodeID(ns.ID(), "value"), "value", int32(0)))
+	sub := NewSubscription()
+	monitorNode(srv, sub, 1, node.ID(), 42)
+	item := srv.MonitoredItemService.Nodes[node.ID().String()][0]
+	item.sampleInterval = time.Millisecond
+	t.Cleanup(item.stopSampling)
+
+	var last int32
+	for start := time.Now(); time.Since(start) < 300*time.Millisecond; {
+		last++
+		if got := ns.SetAttribute(node.ID(), ua.AttributeIDValue, DataValueFromValue(last)); got != ua.StatusOK {
+			t.Fatalf("SetAttribute = %v", got)
+		}
+	}
+	waitForPendingValue(t, sub, 42, last)
+}
+
+func TestDeferredSamplesDoNotReadMapNamespaceOnTimer(t *testing.T) {
+	srv := New()
+	srv.initHandlers()
+	ns := NewMapNamespace(srv, "sampling")
+	ns.SetValue("value", int32(0))
+	node := ua.NewStringNodeID(ns.ID(), "value")
+	sub := NewSubscription()
+	monitorNode(srv, sub, 1, node, 42)
+	item := srv.MonitoredItemService.Nodes[node.String()][0]
+	item.sampleInterval = time.Millisecond
+	t.Cleanup(item.stopSampling)
+
+	var last int32
+	for start := time.Now(); time.Since(start) < 300*time.Millisecond; {
+		last++
+		ns.SetValue("value", last)
+	}
+	waitForPendingValue(t, sub, 42, last)
+}
+
+// waitForPendingValue waits for the final update of a burst to arrive.
+func waitForPendingValue(t *testing.T, sub *Subscription, clientHandle uint32, want int32) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		got, ok := pendingValue(t, sub, clientHandle)
+		if ok && got == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("final update = %d (present %v), want %d", got, ok, want)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 // CreateMonitoredItems revises each item's sampling interval against its node's
 // MinimumSamplingInterval attribute, samples at that revised interval, and
 // rejects an item that does not name a node.
