@@ -1493,14 +1493,25 @@ func (s *SecureChannel) writeResponse(ctx context.Context, payload []byte) (int,
 		_ = s.c.Close()
 		return n, false, err
 	}
+	if testHookAfterResponseWrite != nil {
+		testHookAfterResponseWrite()
+	}
 	if hasDeadline {
+		// The response is already written in full. Clearing the deadline
+		// fails only once the conn is closed, typically because the reader
+		// saw the client's CloseSecureChannel right after this response.
+		// That does not undo the delivery, and a closed conn keeps no
+		// deadline for later writers.
 		if err := s.c.SetWriteDeadline(time.Time{}); err != nil {
 			_ = s.c.Close()
-			return n, false, err
 		}
 	}
 	return n, false, nil
 }
+
+// testHookAfterResponseWrite, when set by a test, runs between a complete
+// response write and the write deadline reset.
+var testHookAfterResponseWrite func()
 
 func responseWriteDeadline(ctx context.Context, timeout time.Duration, now time.Time) (time.Time, bool) {
 	var deadline time.Time

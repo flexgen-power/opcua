@@ -83,6 +83,48 @@ func TestWriteResponseClearsDeadlineAfterSuccess(t *testing.T) {
 	}
 }
 
+func TestWriteResponseCompleteWriteSurvivesCloseBeforeDeadlineReset(t *testing.T) {
+	// A client that has its response can send CloseSecureChannel and close
+	// at once, and the channel's reader then closes the conn. When that lands
+	// between the write and the deadline reset, the response was still
+	// delivered in full and must not be reported as a send failure.
+	serverTCP, clientTCP := tcpPair(t)
+	defer serverTCP.Close()
+	defer clientTCP.Close()
+
+	conn, err := uacp.NewConn(serverTCP, nil)
+	if err != nil {
+		t.Fatalf("new UACP connection: %v", err)
+	}
+	sc := &SecureChannel{
+		c:   conn,
+		cfg: &Config{ResponseWriteTimeout: time.Second},
+	}
+
+	testHookAfterResponseWrite = func() { _ = conn.Close() }
+	defer func() { testHookAfterResponseWrite = nil }()
+
+	payload := []byte("complete response")
+	n, timedOut, err := sc.writeResponse(context.Background(), payload)
+	if err != nil {
+		t.Fatalf("complete response reported as failed: %v", err)
+	}
+	if timedOut || n != len(payload) {
+		t.Fatalf("n=%d timedOut=%t; want n=%d timedOut=false", n, timedOut, len(payload))
+	}
+
+	got := make([]byte, len(payload))
+	if err := clientTCP.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	if _, err := io.ReadFull(clientTCP, got); err != nil {
+		t.Fatalf("client read: %v", err)
+	}
+	if string(got) != string(payload) {
+		t.Fatalf("client read %q; want %q", got, payload)
+	}
+}
+
 func tcpPair(t *testing.T) (*net.TCPConn, *net.TCPConn) {
 	t.Helper()
 	listener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
