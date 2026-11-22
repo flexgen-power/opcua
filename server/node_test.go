@@ -1,6 +1,7 @@
 package server
 
 import (
+	"sync"
 	"testing"
 
 	"github.com/gopcua/opcua/id"
@@ -118,4 +119,49 @@ func TestNodeAttributesAreSafeForConcurrentUse(t *testing.T) {
 		require.NotNil(t, n.DataType())
 	}
 	require.Equal(t, int32(2000), n.Value().Value.Value())
+}
+
+// TestAttributeReadsLeaveStoredValuesUnchanged reads a node's NodeClass
+// through the namespace and its DisplayName from several goroutines at once,
+// along with the stored DisplayName that a Read encodes. Both reads used to
+// rewrite the stored value (NodeClass from uint32 to int32, the DisplayName's
+// encoding mask), so concurrent reads of a node raced each other. Run with
+// -race.
+func TestAttributeReadsLeaveStoredValuesUnchanged(t *testing.T) {
+	ns := NewNameSpace("test")
+	nodeID := ua.NewStringNodeID(1, "x")
+	n := ns.AddNode(NewNode(
+		nodeID,
+		Attributes{
+			ua.AttributeIDNodeClass:   DataValueFromValue(uint32(ua.NodeClassVariable)),
+			ua.AttributeIDDisplayName: DataValueFromValue(&ua.LocalizedText{Text: "x"}),
+		},
+		nil,
+		nil,
+	))
+	want := &ua.LocalizedText{EncodingMask: ua.LocalizedTextText, Text: "x"}
+
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if got := ns.Attribute(nodeID, ua.AttributeIDNodeClass).Value.Value(); got != int32(ua.NodeClassVariable) {
+				t.Errorf("NodeClass = %#v, want int32 %d", got, ua.NodeClassVariable)
+			}
+			if got := n.DisplayName(); *got != *want {
+				t.Errorf("DisplayName() = %+v, want %+v", got, want)
+			}
+			// NewNode sets the mask of a stored text that lacks one, so a Read
+			// encodes the text.
+			if got := ns.Attribute(nodeID, ua.AttributeIDDisplayName).Value.Value().(*ua.LocalizedText); got.EncodingMask != ua.LocalizedTextText {
+				t.Errorf("stored DisplayName mask = %#x, want %#x", got.EncodingMask, ua.LocalizedTextText)
+			}
+		}()
+	}
+	wg.Wait()
+
+	nodeClass, err := n.Attribute(ua.AttributeIDNodeClass)
+	require.NoError(t, err)
+	require.Equal(t, uint32(ua.NodeClassVariable), nodeClass.Value.Value.Value())
 }

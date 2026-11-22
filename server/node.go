@@ -167,6 +167,10 @@ func (n *Node) sanitize() {
 	}
 	if n.DisplayName().Text == "" {
 		n.SetDisplayName(n.BrowseName().Name, "")
+	} else if lt, ok := n.attr[ua.AttributeIDDisplayName].Value.Value().(*ua.LocalizedText); ok {
+		// A Read encodes the stored text by its mask, and DisplayName only
+		// sets the mask on a copy, so set it here before the node is shared.
+		lt.UpdateMask()
 	}
 	if n.attr[ua.AttributeIDDescription] == nil {
 		n.SetDescription("", "")
@@ -259,9 +263,10 @@ func (n *Node) DisplayName() *ua.LocalizedText {
 	if v == nil || v.Value.Value() == nil {
 		return &ua.LocalizedText{}
 	}
-	val := v.Value.Value().(*ua.LocalizedText)
+	// Set the mask on a copy: the stored text is shared with every other read.
+	val := *v.Value.Value().(*ua.LocalizedText)
 	val.UpdateMask()
-	return val
+	return &val
 }
 
 func (n *Node) SetDisplayName(text, locale string) {

@@ -156,9 +156,12 @@ func (as *NodeNameSpace) Attribute(id *ua.NodeID, attr ua.AttributeID) *ua.DataV
 			return errorDataValueWithStatus(ua.StatusBadAttributeIDInvalid)
 		}
 		// TODO: we need int32 instead of uint32 here.  this isn't the right place to fix it, but it is a bandaid
+		// Convert a copy: the stored attribute is shared with every other read.
 		x, ok := a.Value.Value.Value().(uint32)
 		if ok {
-			a.Value.Value = ua.MustVariant(int32(x))
+			dv := *a.Value
+			dv.Value = ua.MustVariant(int32(x))
+			return &dv
 		}
 	case ua.AttributeIDDataType:
 		a, err = n.Attribute(attr)
