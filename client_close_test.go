@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"runtime"
 	"sync"
 	"syscall"
 	"testing"
@@ -20,19 +21,7 @@ import (
 // dial must not leave the client connected after Close has returned.
 func TestClientCloseDuringConnect(t *testing.T) {
 	ctx := context.Background()
-
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	port := l.Addr().(*net.TCPAddr).Port
-	require.NoError(t, l.Close())
-
-	srv := server.New(
-		server.EndPoint("127.0.0.1", port),
-		server.EnableSecurity("None", ua.MessageSecurityModeNone),
-		server.EnableAuthMode(ua.UserTokenTypeAnonymous),
-	)
-	require.NoError(t, srv.Start(ctx))
-	t.Cleanup(func() { srv.Close() })
+	endpoint := startServer(t)
 
 	// The dial stops before it connects and waits for release, which comes
 	// once Close has returned.
@@ -53,7 +42,7 @@ func TestClientCloseDuringConnect(t *testing.T) {
 		ClientACK: &uacp.Acknowledge{ReceiveBufSize: uacp.DefaultReceiveBufSize, SendBufSize: uacp.DefaultSendBufSize},
 	}
 
-	c, err := opcua.NewClient(fmt.Sprintf("opc.tcp://127.0.0.1:%d", port),
+	c, err := opcua.NewClient(endpoint,
 		opcua.SecurityMode(ua.MessageSecurityModeNone),
 		opcua.SecurityPolicy("None"),
 		opcua.AuthAnonymous(),
@@ -88,4 +77,63 @@ func TestClientCloseDuringConnect(t *testing.T) {
 	}
 	require.Nil(t, c.SecureChannel())
 	require.Equal(t, opcua.Closed, c.State())
+}
+
+// Dial must not connect the client when its context is canceled after
+// OpenSecureChannel has completed.
+func TestClientDialCanceledAfterOpen(t *testing.T) {
+	c, err := opcua.NewClient(startServer(t),
+		opcua.SecurityMode(ua.MessageSecurityModeNone),
+		opcua.SecurityPolicy("None"),
+		opcua.AuthAnonymous(),
+		opcua.AutoReconnect(false),
+		opcua.Dialer(&uacp.Dialer{
+			// not uacp.DefaultClientACK, which other tests in this package change
+			ClientACK: &uacp.Acknowledge{ReceiveBufSize: uacp.DefaultReceiveBufSize, SendBufSize: uacp.DefaultSendBufSize},
+		}),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { c.Close(context.Background()) })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	err = c.Dial(&cancelOnDialCheck{Context: ctx, cancel: cancel})
+	require.ErrorIs(t, err, context.Canceled)
+	require.Nil(t, c.SecureChannel())
+}
+
+// cancelOnDialCheck is canceled when Client.Dial asks for its error, which
+// Dial does only after OpenSecureChannel has completed and before it connects
+// the client.
+type cancelOnDialCheck struct {
+	context.Context
+	cancel context.CancelFunc
+}
+
+func (c *cancelOnDialCheck) Err() error {
+	pc := make([]uintptr, 1)
+	runtime.Callers(2, pc)
+	if f, _ := runtime.CallersFrames(pc).Next(); f.Function == "github.com/gopcua/opcua.(*Client).Dial" {
+		c.cancel()
+	}
+	return c.Context.Err()
+}
+
+// startServer starts a server without security and returns its endpoint.
+func startServer(t *testing.T) string {
+	t.Helper()
+
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	port := l.Addr().(*net.TCPAddr).Port
+	require.NoError(t, l.Close())
+
+	srv := server.New(
+		server.EndPoint("127.0.0.1", port),
+		server.EnableSecurity("None", ua.MessageSecurityModeNone),
+		server.EnableAuthMode(ua.UserTokenTypeAnonymous),
+	)
+	require.NoError(t, srv.Start(context.Background()))
+	t.Cleanup(func() { srv.Close() })
+	return fmt.Sprintf("opc.tcp://127.0.0.1:%d", port)
 }
