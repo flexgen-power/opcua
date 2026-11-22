@@ -76,6 +76,10 @@ type serverConfig struct {
 	responseWriteTimeout   time.Duration
 	requestDispatchTimeout time.Duration
 
+	// minimumSamplingInterval is the sampling floor, in milliseconds, for every
+	// monitored item.
+	minimumSamplingInterval float64
+
 	logger Logger
 }
 

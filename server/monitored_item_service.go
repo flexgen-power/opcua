@@ -397,10 +397,14 @@ func (s *MonitoredItemService) CreateMonitoredItems(sc *uasc.SecureChannel, r ua
 		if item == nil || item.ItemToMonitor == nil || item.ItemToMonitor.NodeID == nil || item.RequestedParameters == nil {
 			continue
 		}
-		minimum := float64(0)
+		// The server floor covers every item, including one whose node does not
+		// exist yet; a node's own MinimumSamplingInterval can only raise it.
+		minimum := s.SubService.srv.cfg.minimumSamplingInterval
 		if ns, err := s.SubService.srv.Namespace(int(item.ItemToMonitor.NodeID.Namespace())); err == nil {
 			if value := ns.Attribute(item.ItemToMonitor.NodeID, ua.AttributeIDMinimumSamplingInterval); value != nil && value.Value != nil {
-				minimum, _ = value.Value.Value().(float64)
+				if node, ok := value.Value.Value().(float64); ok && node > minimum && !math.IsInf(node, 1) {
+					minimum = node
+				}
 			}
 		}
 		intervals[i] = reviseSamplingInterval(item.RequestedParameters.SamplingInterval, sub.RevisedPublishingInterval, minimum)

@@ -8,6 +8,7 @@ import (
 	"crypto/rsa"
 	"fmt"
 	"log"
+	"math"
 	"strings"
 	"time"
 
@@ -142,6 +143,22 @@ func ResponseWriteTimeout(timeout time.Duration) Option {
 func RequestDispatchTimeout(timeout time.Duration) Option {
 	return func(s *serverConfig) {
 		s.requestDispatchTimeout = timeout
+	}
+}
+
+// MinimumSamplingInterval sets the fastest sampling interval, in milliseconds,
+// that the server grants a monitored item. CreateMonitoredItems revises a
+// faster requested interval up to it, also for an item whose node does not
+// exist yet. A node's MinimumSamplingInterval attribute can raise the floor
+// for that node but not lower it. Zero, the default, leaves each node's
+// attribute as the only floor; a negative, NaN or infinite value counts as
+// zero.
+func MinimumSamplingInterval(ms float64) Option {
+	return func(s *serverConfig) {
+		if !(ms >= 0) || math.IsInf(ms, 0) {
+			ms = 0
+		}
+		s.minimumSamplingInterval = ms
 	}
 }
 

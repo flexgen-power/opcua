@@ -241,3 +241,58 @@ func TestCreateMonitoredItemsHonorsNodeMinimumSamplingInterval(t *testing.T) {
 		t.Fatalf("empty item result %v, want BadInvalidArgument", got)
 	}
 }
+
+// A server-wide MinimumSamplingInterval applies to every monitored item,
+// including one created before its node exists, and a node's own
+// MinimumSamplingInterval attribute can only raise it.
+func TestCreateMonitoredItemsHonorsServerMinimumSamplingInterval(t *testing.T) {
+	srv := New(MinimumSamplingInterval(1000))
+	srv.initHandlers()
+	sess := srv.sb.NewSession()
+	subID := createTestSubscription(t, srv, sess)
+	ns := NewNodeNameSpace(srv, "sampling")
+	withFloor := func(name string, floor float64) *ua.NodeID {
+		node := NewVariableNode(ua.NewStringNodeID(ns.ID(), name), name, int32(0))
+		if err := node.SetAttribute(ua.AttributeIDMinimumSamplingInterval, DataValueFromValue(floor)); err != nil {
+			t.Fatalf("SetAttribute: %v", err)
+		}
+		return ns.AddNode(node).ID()
+	}
+	nodes := []*ua.NodeID{
+		ua.NewStringNodeID(ns.ID(), "not-yet-created"),
+		withFloor("lower", 250),
+		withFloor("higher", 2000),
+	}
+	var items []*ua.MonitoredItemCreateRequest
+	for i, node := range nodes {
+		items = append(items, &ua.MonitoredItemCreateRequest{
+			ItemToMonitor:       &ua.ReadValueID{NodeID: node, AttributeID: ua.AttributeIDValue},
+			MonitoringMode:      ua.MonitoringModeReporting,
+			RequestedParameters: &ua.MonitoringParameters{ClientHandle: uint32(i + 1), SamplingInterval: 100},
+		})
+	}
+	resp, err := srv.MonitoredItemService.CreateMonitoredItems(nil, &ua.CreateMonitoredItemsRequest{
+		RequestHeader:  &ua.RequestHeader{AuthenticationToken: sess.AuthTokenID},
+		SubscriptionID: subID,
+		ItemsToCreate:  items,
+	}, 0)
+	if err != nil {
+		t.Fatalf("CreateMonitoredItems: %v", err)
+	}
+	results := resp.(*ua.CreateMonitoredItemsResponse).Results
+	for i, want := range []float64{1000, 1000, 2000} {
+		r := results[i]
+		if r.StatusCode != ua.StatusOK || r.RevisedSamplingInterval != want {
+			t.Fatalf("%s: result %+v, want StatusOK with revised interval %v", nodes[i], r, want)
+		}
+		srv.MonitoredItemService.Mu.Lock()
+		item := srv.MonitoredItemService.Items[r.MonitoredItemID]
+		srv.MonitoredItemService.Mu.Unlock()
+		item.sampleMu.Lock()
+		got := item.sampleInterval
+		item.sampleMu.Unlock()
+		if got != time.Duration(want)*time.Millisecond {
+			t.Fatalf("%s: item samples every %v, want %v ms", nodes[i], got, want)
+		}
+	}
+}
