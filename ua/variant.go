@@ -390,7 +390,9 @@ func (m *Variant) encodeValue(buf *Buffer, v interface{}) {
 	case float64:
 		buf.WriteFloat64(x)
 	case string:
-		buf.WriteString(x)
+		// Write the length explicitly so that "" goes on the wire as an
+		// empty String (length 0), not a null String (length -1).
+		buf.WriteByteString([]byte(x))
 	case time.Time:
 		buf.WriteTime(x)
 	case *GUID:
@@ -398,7 +400,8 @@ func (m *Variant) encodeValue(buf *Buffer, v interface{}) {
 	case []byte:
 		buf.WriteByteString(x)
 	case XMLElement:
-		buf.WriteString(string(x))
+		// As for string, an empty XmlElement has length 0.
+		buf.WriteByteString([]byte(x))
 	case *NodeID:
 		buf.WriteStruct(x)
 	case *ExpandedNodeID:

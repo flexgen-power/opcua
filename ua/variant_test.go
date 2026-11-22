@@ -142,6 +142,16 @@ func TestVariant(t *testing.T) {
 			},
 		},
 		{
+			Name:   "empty string",
+			Struct: MustVariant(""),
+			Bytes: []byte{
+				// variant encoding mask
+				0x0c,
+				// value: length 0, not the null String's -1
+				0x00, 0x00, 0x00, 0x00,
+			},
+		},
+		{
 			Name:   "DateTime",
 			Struct: MustVariant(time.Date(2018, time.September, 17, 14, 28, 29, 112000000, time.UTC)),
 			Bytes: []byte{
@@ -187,6 +197,16 @@ func TestVariant(t *testing.T) {
 				// value
 				0x03, 0x00, 0x00, 0x00,
 				'a', 'b', 'c',
+			},
+		},
+		{
+			Name:   "empty XMLElement",
+			Struct: MustVariant(XMLElement("")),
+			Bytes: []byte{
+				// variant encoding mask
+				0x10,
+				// value: length 0, not the null XmlElement's -1
+				0x00, 0x00, 0x00, 0x00,
 			},
 		},
 		{
@@ -473,6 +493,19 @@ func TestVariant(t *testing.T) {
 				// array dimensions
 				0x03, 0x00, 0x00, 0x00,
 				0x01, 0x00, 0x00, 0x00,
+			},
+		},
+		{
+			Name:   "[]string with an empty element",
+			Struct: MustVariant([]string{"", "a"}),
+			Bytes: []byte{
+				// variant encoding mask
+				0x8c,
+				// array length
+				0x02, 0x00, 0x00, 0x00,
+				// array values: "" with length 0, then "a"
+				0x00, 0x00, 0x00, 0x00,
+				0x01, 0x00, 0x00, 0x00, 'a',
 			},
 		},
 		{
