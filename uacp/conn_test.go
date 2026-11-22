@@ -6,6 +6,7 @@ package uacp
 
 import (
 	"context"
+	"io"
 	"net"
 	"testing"
 	"time"
@@ -60,6 +61,41 @@ func TestConn(t *testing.T) {
 			t.Error(err)
 		}
 	})
+}
+
+// A peer that accepts the connection but never answers the HEL must not hold
+// Dial after its context is canceled.
+func TestDialCanceledDuringHandshake(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer l.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := Dial(ctx, "opc.tcp://"+l.Addr().String())
+		done <- err
+	}()
+
+	peer, err := l.Accept()
+	require.NoError(t, err)
+	defer peer.Close()
+
+	// once the HEL has arrived, Dial is waiting for the ACK
+	hdr := make([]byte, hdrlen)
+	_, err = io.ReadFull(peer, hdr)
+	require.NoError(t, err)
+	require.Equal(t, "HELF", string(hdr[:4]))
+	cancel()
+
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(2 * time.Second):
+		require.Fail(t, "Dial still waits for the ACK after its context was canceled")
+	}
 }
 
 func TestClientWrite(t *testing.T) {

@@ -146,10 +146,15 @@ type Client struct {
 	// cfg is the configuration for the client.
 	cfg *Config
 
-	// connMu serializes Dial with connection cleanup in Close and the monitor.
+	// connMu orders Dial publishing a new connection against connection
+	// cleanup in Close and the monitor. Dial does not hold it while it talks
+	// to the peer.
 	connMu sync.Mutex
 	// conn is the open connection, guarded by connMu.
 	conn *uacp.Conn
+	// closeGen counts calls to Close, guarded by connMu. Dial discards its
+	// connection if Close was called while it was dialing.
+	closeGen uint64
 
 	// sechan is the open secure channel.
 	atomicSechan atomic.Value // *uasc.SecureChannel
@@ -608,33 +613,56 @@ func (c *Client) monitor(ctx context.Context) {
 }
 
 // Dial establishes a secure channel.
+//
+// If ctx is done or Close is called while Dial is in progress, Dial closes the
+// connection it opened and returns an error instead of connecting the client.
 func (c *Client) Dial(ctx context.Context) error {
 	stats.Client().Add("Dial", 1)
-	c.connMu.Lock()
-	defer c.connMu.Unlock()
 
 	if c.SecureChannel() != nil {
 		return errors.Errorf("secure channel already connected")
 	}
 
-	var err error
-	c.conn, err = c.cfg.dialer.Dial(ctx, c.endpointURL)
+	c.connMu.Lock()
+	gen := c.closeGen
+	c.connMu.Unlock()
+
+	// Talk to the peer without connMu so that Close does not wait for it.
+	conn, err := c.cfg.dialer.Dial(ctx, c.endpointURL)
 	if err != nil {
 		return err
 	}
 
-	sc, err := uasc.NewSecureChannel(c.endpointURL, c.conn, c.cfg.sechan, c.sechanErr)
+	sc, err := uasc.NewSecureChannel(c.endpointURL, conn, c.cfg.sechan, c.sechanErr)
 	if err != nil {
-		c.conn.Close()
+		conn.Close()
 		return err
 	}
 
 	if err := sc.Open(ctx); err != nil {
-		c.conn.Close()
+		conn.Close()
 		return err
 	}
-	c.setSecureChannel(sc)
 
+	c.connMu.Lock()
+	switch {
+	case ctx.Err() != nil:
+		err = ctx.Err()
+	case c.closeGen != gen:
+		err = errors.Errorf("client closed while dialing")
+	case c.SecureChannel() != nil:
+		err = errors.Errorf("secure channel already connected")
+	default:
+		c.conn = conn
+		c.setSecureChannel(sc)
+	}
+	c.connMu.Unlock()
+
+	if err != nil {
+		sc.Close()
+		conn.Close()
+		return err
+	}
 	return nil
 }
 
@@ -650,10 +678,14 @@ func (c *Client) Close(ctx context.Context) error {
 	if c.mcancel != nil {
 		c.mcancel()
 	}
-	// Cancel first so an in-flight reconnect can finish before cleanup takes
-	// ownership of the connection and secure channel.
+	// Dial does not hold connMu while it talks to the peer, so Close does not
+	// wait for a dial in progress, whether the monitor's reconnect or a
+	// concurrent Connect. Bumping closeGen makes that dial close what it
+	// opened instead of publishing it, so it cannot leave the client
+	// connected after Close.
 	c.connMu.Lock()
 	defer c.connMu.Unlock()
+	c.closeGen++
 	if sc := c.SecureChannel(); sc != nil {
 		sc.Close()
 		c.setSecureChannel(nil)

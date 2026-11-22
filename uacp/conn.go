@@ -260,11 +260,22 @@ func (c *Conn) Handshake(ctx context.Context, endpoint string) error {
 		c.SetDeadline(dl)
 	}
 
+	// move the deadline into the past once ctx is done, so that canceling
+	// ctx ends the handshake even if the peer never answers the HEL.
+	stop := context.AfterFunc(ctx, func() { c.SetDeadline(time.Unix(1, 0)) })
+	defer stop()
+
 	if err := c.Send("HELF", hel); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		return err
 	}
 
 	b, err := c.Receive()
+	if !stop() {
+		return ctx.Err()
+	}
 	if err != nil {
 		return err
 	}
