@@ -3,6 +3,7 @@ package server
 import (
 	"crypto/rand"
 	"log"
+	"math"
 	"strings"
 	"time"
 
@@ -52,10 +53,13 @@ func (s *SessionService) CreateSession(sc *uasc.SecureChannel, r ua.Request, req
 		return nil, ua.StatusBadSecurityChecksFailed
 	}
 
-	// Ensure session timeout is reasonable
-	timeout := time.Duration(req.RequestedSessionTimeout) * time.Millisecond
-	if timeout > sessionTimeoutMax || timeout < sessionTimeoutMin {
-		timeout = sessionTimeoutDefault
+	// Ensure session timeout is reasonable. Check the range on the whole
+	// milliseconds before converting: a huge request overflows
+	// time.Duration and can wrap into range, and NaN fails every comparison.
+	timeout := sessionTimeoutDefault
+	ms := math.Trunc(req.RequestedSessionTimeout)
+	if ms >= float64(sessionTimeoutMin/time.Millisecond) && ms <= float64(sessionTimeoutMax/time.Millisecond) {
+		timeout = time.Duration(ms) * time.Millisecond
 	}
 
 	nonce := make([]byte, sessionNonceLength)
