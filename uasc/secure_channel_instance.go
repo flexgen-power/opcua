@@ -258,6 +258,13 @@ func (c *channelInstance) signAndEncrypt(m *Message, b []byte) ([]byte, error) {
 	return append(b[:headerLength], p...), nil
 }
 
+// maxOpenCiphertext bounds the encrypted part of an OpenSecureChannel chunk.
+// It is decrypted one private-key operation per block before the peer's
+// signature can be checked, so it must not be bounded by the receive buffer
+// alone. A real request or response is a nonce, a few fixed fields, padding
+// and a signature: about 1 KB with the largest keys the policies allow.
+const maxOpenCiphertext = 4096
+
 // verifyAndDecrypt verifies and optionally decrypts an incoming chunk.
 //
 // An asymmetric OpenSecureChannel under a real security policy is always signed
@@ -298,6 +305,9 @@ func (c *channelInstance) verifyAndDecrypt(m *MessageChunk, r []byte) ([]byte, e
 		headerLength += m.SymmetricSecurityHeader.Len()
 	}
 	if len(r) < headerLength {
+		return nil, ua.StatusBadSecurityChecksFailed
+	}
+	if isAsymmetric && len(r)-headerLength > maxOpenCiphertext {
 		return nil, ua.StatusBadSecurityChecksFailed
 	}
 
