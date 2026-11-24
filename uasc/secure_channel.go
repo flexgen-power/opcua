@@ -565,6 +565,12 @@ func (s *SecureChannel) readChunk() (*MessageChunk, error) {
 				return nil, err
 			}
 		} else {
+			if s.kind == server {
+				if err := s.checkOpenPolicy(m.SecurityPolicyURI); err != nil {
+					debug.Printf("uasc %d: refused OpenSecureChannel: %s", s.c.ID(), err)
+					return nil, err
+				}
+			}
 			s.cfg.SecurityPolicyURI = m.SecurityPolicyURI
 		}
 		decryptWith = s.openingInstance
@@ -864,6 +870,10 @@ func (s *SecureChannel) handleOpenSecureChannelRequest(reqID uint32, svc ua.Requ
 	renewal := s.established()
 	if renewal {
 		if err := s.checkRenewalMode(req); err != nil {
+			return err
+		}
+	} else if s.kind == server {
+		if err := s.checkOpenMode(req.SecurityMode); err != nil {
 			return err
 		}
 	}
