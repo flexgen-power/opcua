@@ -156,7 +156,13 @@ func (s *SessionService) ActivateSession(sc *uasc.SecureChannel, r ua.Request, r
 
 	identity, code := s.authenticateIdentity(sc, sess, req)
 	if code != ua.StatusOK {
-		s.warn("ActivateSession from %s rejected: %s", remoteAddr(sc), code)
+		// The application logs its own refusals and may bound them, as for a
+		// lockout; a warning here per attempt would undo that.
+		if !identity.byAuthenticator {
+			s.warn("ActivateSession from %s rejected: %s", remoteAddr(sc), code)
+		} else if s.srv.cfg.logger != nil {
+			s.srv.cfg.logger.Debug("ActivateSession from %s rejected by the authenticator: %s", remoteAddr(sc), code)
+		}
 		return nil, code
 	}
 	if transfer {

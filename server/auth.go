@@ -70,7 +70,8 @@ func ClientCertificateValidator(v func(cert []byte) error) Option {
 	}
 }
 
-// identityResult carries what ActivateSession needs to know about an accepted token.
+// identityResult carries what ActivateSession needs to know about an accepted
+// token, or who refused it.
 type identityResult struct {
 	tokenType ua.UserTokenType
 	policyID  string
@@ -79,6 +80,9 @@ type identityResult struct {
 	// checked to be the same identity: "anonymous", "user:<name>" or
 	// "cert:<thumbprint>".
 	key string
+	// byAuthenticator marks a refusal as the Authenticator's decision rather
+	// than a fault this package found in the token.
+	byAuthenticator bool
 }
 
 // authenticateIdentity resolves the identity token of an ActivateSession
@@ -173,9 +177,9 @@ func (s *SessionService) authenticateIdentity(sc *uasc.SecureChannel, sess *sess
 		// else, including StatusOK returned as an error, still refuses.
 		var code ua.StatusCode
 		if errors.As(err, &code) && code&ua.StatusBad != 0 {
-			return identityResult{}, code
+			return identityResult{byAuthenticator: true}, code
 		}
-		return identityResult{}, ua.StatusBadUserAccessDenied
+		return identityResult{byAuthenticator: true}, ua.StatusBadUserAccessDenied
 	}
 	return res, ua.StatusOK
 }

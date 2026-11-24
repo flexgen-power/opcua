@@ -166,3 +166,41 @@ func TestOverlongUserNameIsRefusedBeforeDecrypt(t *testing.T) {
 	requireStatus(t, rs.activate(t, ctx, strings.Repeat("u", 256), secret), ua.StatusBadUserAccessDenied)
 	require.EqualValues(t, 1, ss.authHits.Load())
 }
+
+// The application's Authenticator owns login logging: it may log a lockout
+// once and then stay quiet. The server must not add a warning of its own for
+// each refusal the Authenticator returns, or that bound is lost. Refusals the
+// server detects itself still warn.
+func TestAuthenticatorRefusalsAreNotWarned(t *testing.T) {
+	log := &captureLogger{}
+	ss := startSecureServer(t, server.SetLogger(log))
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	rs := createRawSession(t, ctx, ss)
+
+	// The per-request diagnostic line is not about logins and is not counted.
+	rejections := func(level string) int {
+		log.mu.Lock()
+		defer log.mu.Unlock()
+		n := 0
+		for _, line := range log.lines {
+			if strings.HasPrefix(line, level+" ") && !strings.Contains(line, "gopcua_diag") && strings.Contains(line, "ActivateSession from") {
+				n++
+			}
+		}
+		return n
+	}
+
+	const refusals = 5
+	for i := 0; i < refusals; i++ {
+		requireStatus(t, rs.activate(t, ctx, testUser, rs.secret(t, "wrong")), ua.StatusBadUserAccessDenied)
+	}
+	require.EqualValues(t, refusals, ss.authHits.Load())
+	require.Zero(t, rejections("WARN"), "the server warned about refusals the authenticator decided")
+	require.Equal(t, refusals, rejections("DEBUG"))
+
+	rs.policyID = "no-such-policy"
+	requireStatus(t, rs.activate(t, ctx, testUser, rs.secret(t, "wrong")), ua.StatusBadIdentityTokenInvalid)
+	require.EqualValues(t, refusals, ss.authHits.Load(), "the authenticator saw a token the server should have refused")
+	require.Equal(t, 1, rejections("WARN"))
+}
