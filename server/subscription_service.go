@@ -205,7 +205,7 @@ func (s *SubscriptionService) Publish(sc *uasc.SecureChannel, r ua.Request, reqI
 	}
 
 	select {
-	case session.PublishRequests <- PubReq{Req: req, ID: reqID}:
+	case session.PublishRequests <- PubReq{Req: req, ID: reqID, Channel: sc}:
 	default:
 		if s.srv.cfg.logger != nil {
 			s.srv.cfg.logger.Warn("Too many publish reqs.")
@@ -303,6 +303,11 @@ type PubReq struct {
 
 	// The request ID (from the header) of the publish request.  This has to be used when replying.
 	ID uint32
+
+	// Channel is the secure channel the publish request arrived on. The
+	// response goes back on it: ID only means something there, and after a
+	// session moves to a new channel the subscription's own channel is closed.
+	Channel *uasc.SecureChannel
 }
 
 // This is the type that with its run() function will work in the bakground fullfilling subscription
@@ -454,7 +459,7 @@ func (s *Subscription) keepalive(pubreq PubReq) error {
 		Results:                  []ua.StatusCode{},
 		DiagnosticInfos:          []*ua.DiagnosticInfo{},
 	}
-	err := s.Channel.SendResponseWithContext(context.Background(), pubreq.ID, response)
+	err := pubreq.Channel.SendResponseWithContext(context.Background(), pubreq.ID, response)
 	if err != nil {
 		return err
 	}
@@ -624,7 +629,7 @@ func (s *Subscription) run() {
 			Results:                  []ua.StatusCode{},
 			DiagnosticInfos:          []*ua.DiagnosticInfo{},
 		}
-		err := s.Channel.SendResponseWithContext(context.Background(), pubreq.ID, response)
+		err := pubreq.Channel.SendResponseWithContext(context.Background(), pubreq.ID, response)
 		if err != nil {
 			if s.srv.srv.cfg.logger != nil {
 				s.srv.srv.cfg.logger.Error("problem sending channel response: %v", err)

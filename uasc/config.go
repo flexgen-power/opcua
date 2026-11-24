@@ -50,6 +50,11 @@ type Config struct {
 	// Used to encrypt the message chunks in the OpenSecureChannel phase.
 	RemoteCertificate []byte
 
+	// RemoteCertificateValidator, when set, is called with the certificate a
+	// peer presents in an inbound OpenSecureChannel request before any of it is
+	// used. A non-nil error refuses the channel. Only the server side sets it.
+	RemoteCertificateValidator func(cert []byte) error
+
 	// RequestIDSeed is the initial value for RequestID counter in each new SecureChannel
 	RequestIDSeed uint32
 

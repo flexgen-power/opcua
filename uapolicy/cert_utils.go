@@ -47,12 +47,17 @@ func ParseCertificate(c []byte) (*x509.Certificate, error) {
 	return certs[0], nil
 }
 
-// PublicKey returns the RSA PublicKey from a DER-encoded certificate
+// PublicKey returns the RSA PublicKey from a DER-encoded certificate. A
+// certificate with any other kind of key is an error: the certificate can come
+// from the peer, and the security policies here are all RSA.
 func PublicKey(c []byte) (*rsa.PublicKey, error) {
 	cert, err := ParseCertificate(c)
 	if err != nil {
 		return nil, err
 	}
-
-	return cert.PublicKey.(*rsa.PublicKey), nil
+	key, ok := cert.PublicKey.(*rsa.PublicKey)
+	if !ok {
+		return nil, fmt.Errorf("uapolicy: certificate has a %T key, not an RSA key", cert.PublicKey)
+	}
+	return key, nil
 }
