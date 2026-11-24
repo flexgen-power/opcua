@@ -204,11 +204,26 @@ func (s *SessionService) matchTokenPolicy(peer uasc.PeerSecurity, tokenType ua.U
 	return nil, false
 }
 
+// A UserName token arrives before the client has proved who it is, so what it
+// can make the server process is bounded: the name, and the plaintext an
+// encrypted password field may hold (the length prefix, the password and the
+// server nonce).
+const (
+	maxUserNameLength   = 256
+	maxUserSecretLength = 1024
+)
+
+// decryptSecret is a variable so a test can count the private-key work a token costs.
+var decryptSecret = (*uapolicy.EncryptionAlgorithm).Decrypt
+
 // decryptUserPassword recovers the plaintext password of a UserName token.
 // The secret is the legacy encrypted-secret layout of Part 4, 7.41.2.2:
 // a little-endian uint32 length, the password, then the server nonce the
 // client was last given.
 func (s *SessionService) decryptUserPassword(peer uasc.PeerSecurity, sess *session, policyURI string, tok *ua.UserNameIdentityToken) ([]byte, ua.StatusCode) {
+	if len(tok.UserName) > maxUserNameLength {
+		return nil, ua.StatusBadIdentityTokenInvalid
+	}
 	if policyURI == ua.SecurityPolicyURINone {
 		// A cleartext password is only acceptable inside an encrypted channel.
 		if peer.Mode != ua.MessageSecurityModeSignAndEncrypt {
@@ -224,7 +239,8 @@ func (s *SessionService) decryptUserPassword(peer uasc.PeerSecurity, sess *sessi
 		s.warn("rejecting UserName token: server has no private key to decrypt it")
 		return nil, ua.StatusBadIdentityTokenRejected
 	}
-	enc, err := uapolicy.Asymmetric(policyURI, s.srv.cfg.privateKey, nil)
+	// The public half is passed only so the block sizes below are those of our key.
+	enc, err := uapolicy.Asymmetric(policyURI, s.srv.cfg.privateKey, &s.srv.cfg.privateKey.PublicKey)
 	if err != nil {
 		return nil, ua.StatusBadIdentityTokenInvalid
 	}
@@ -232,7 +248,14 @@ func (s *SessionService) decryptUserPassword(peer uasc.PeerSecurity, sess *sessi
 		return nil, ua.StatusBadIdentityTokenInvalid
 	}
 
-	plain, err := enc.Decrypt(tok.Password)
+	// Each block costs a private-key operation on the request dispatcher, so a
+	// field with more blocks than the largest secret needs is refused unopened.
+	per := enc.PlaintextBlockSize()
+	if per < 1 || len(tok.Password) > (maxUserSecretLength+per-1)/per*enc.BlockSize() {
+		return nil, ua.StatusBadIdentityTokenInvalid
+	}
+
+	plain, err := decryptSecret(enc, tok.Password)
 	if err != nil {
 		return nil, ua.StatusBadIdentityTokenInvalid
 	}

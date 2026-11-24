@@ -1,0 +1,168 @@
+// Copyright 2018-2026 opcua authors. All rights reserved.
+// Use of this source code is governed by a MIT-style license that can be
+// found in the LICENSE file.
+
+package server_test
+
+import (
+	"bytes"
+	"context"
+	"encoding/binary"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/gopcua/opcua/server"
+	"github.com/gopcua/opcua/ua"
+	"github.com/gopcua/opcua/uapolicy"
+	"github.com/gopcua/opcua/uasc"
+)
+
+// rsaBlock is the ciphertext block of the 2048-bit key genCert makes.
+const rsaBlock = 256
+
+// rawSession is a session created, but not yet activated, on a raw
+// SignAndEncrypt channel, so a test can send any identity token it likes.
+type rawSession struct {
+	sc          *uasc.SecureChannel
+	token       *ua.NodeID
+	policyID    string
+	serverCert  []byte
+	serverNonce []byte
+}
+
+func createRawSession(t *testing.T, ctx context.Context, ss *secureServer) *rawSession {
+	t.Helper()
+	ep := endpointFor(t, ctx, ss.addr, ua.MessageSecurityModeSignAndEncrypt)
+	rs := &rawSession{}
+	for _, p := range ep.UserIdentityTokens {
+		if p.TokenType == ua.UserTokenTypeUserName {
+			rs.policyID = p.PolicyID
+		}
+	}
+	require.NotEmpty(t, rs.policyID, "endpoint offers no UserName token policy")
+
+	sc, cfg := openRawChannel(t, ctx, ss)
+	r, err := sendFor(ctx, sc, &ua.CreateSessionRequest{
+		ClientDescription:       &ua.ApplicationDescription{ApplicationType: ua.ApplicationTypeClient, ApplicationName: &ua.LocalizedText{}},
+		EndpointURL:             ss.addr,
+		SessionName:             "bounds",
+		ClientNonce:             make([]byte, 32),
+		ClientCertificate:       cfg.Certificate,
+		RequestedSessionTimeout: 60000,
+	}, nil, 5*time.Second)
+	require.NoError(t, err)
+	res := r.(*ua.CreateSessionResponse)
+	rs.sc, rs.token = sc, res.AuthenticationToken
+	rs.serverCert, rs.serverNonce = res.ServerCertificate, res.ServerNonce
+	return rs
+}
+
+// activate sends a UserName token. A refused activation leaves the session and
+// its nonce as they were, so one session serves several attempts.
+func (rs *rawSession) activate(t *testing.T, ctx context.Context, user string, secret []byte) error {
+	t.Helper()
+	sig, alg, err := rs.sc.NewSessionSignature(bytes.Clone(rs.serverCert), rs.serverNonce)
+	require.NoError(t, err)
+	_, err = sendFor(ctx, rs.sc, &ua.ActivateSessionRequest{
+		ClientSignature: &ua.SignatureData{Signature: sig, Algorithm: alg},
+		UserIdentityToken: ua.NewExtensionObject(&ua.UserNameIdentityToken{
+			PolicyID:            rs.policyID,
+			UserName:            user,
+			Password:            secret,
+			EncryptionAlgorithm: "http://www.w3.org/2001/04/xmlenc#rsa-oaep",
+		}),
+		UserTokenSignature: &ua.SignatureData{},
+	}, rs.token, 30*time.Second)
+	return err
+}
+
+// secret encrypts password in the legacy layout, as a client would.
+func (rs *rawSession) secret(t *testing.T, password string) []byte {
+	t.Helper()
+	b, _, err := rs.sc.EncryptUserPassword("", password, rs.serverCert, rs.serverNonce)
+	require.NoError(t, err)
+	return b
+}
+
+// Every block of an encrypted password costs a private-key operation on the
+// goroutine that serves every client, and a client can send the token before
+// it has proved who it is. A field far larger than any password is refused
+// without decrypting it; an ordinary login is unaffected.
+func TestOversizedEncryptedPasswordIsRefusedBeforeDecrypt(t *testing.T) {
+	decrypted := server.CountSecretCiphertext(t)
+	ss := startSecureServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	rs := createRawSession(t, ctx, ss)
+
+	// One well-formed block, repeated: each would decrypt cleanly, and the
+	// nonce inside is not this session's.
+	pub, err := uapolicy.PublicKey(rs.serverCert)
+	require.NoError(t, err)
+	enc, err := uapolicy.Asymmetric(ua.SecurityPolicyURIBasic256Sha256, nil, pub)
+	require.NoError(t, err)
+	plain := binary.LittleEndian.AppendUint32(nil, 34)
+	plain = append(plain, "pw"...)
+	plain = append(plain, make([]byte, 32)...)
+	block, err := enc.Encrypt(plain)
+	require.NoError(t, err)
+	require.Len(t, block, rsaBlock)
+
+	start := time.Now()
+	err = rs.activate(t, ctx, testUser, bytes.Repeat(block, 128))
+	requireStatus(t, err, ua.StatusBadIdentityTokenInvalid)
+	require.Zero(t, decrypted.Load(), "the oversized field reached the private key")
+	require.Less(t, time.Since(start), 5*time.Second)
+	require.EqualValues(t, 0, ss.authHits.Load())
+
+	// The same session still logs in with a real token: one block, one decrypt.
+	require.NoError(t, rs.activate(t, ctx, testUser, rs.secret(t, testPassword)))
+	require.EqualValues(t, rsaBlock, decrypted.Load())
+	require.EqualValues(t, 1, ss.authHits.Load())
+}
+
+// The bound sits at about a kilobyte of plaintext, counted in whole blocks of
+// the server's key: five for a 2048-bit key under this policy.
+func TestEncryptedPasswordBlockLimit(t *testing.T) {
+	decrypted := server.CountSecretCiphertext(t)
+	ss := startSecureServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	rs := createRawSession(t, ctx, ss)
+
+	// Well-formed for this session in every respect but its size, so only the
+	// bound can refuse it.
+	over := rs.secret(t, strings.Repeat("x", 1100))
+	require.Len(t, over, 6*rsaBlock)
+	requireStatus(t, rs.activate(t, ctx, testUser, over), ua.StatusBadIdentityTokenInvalid)
+	require.Zero(t, decrypted.Load())
+	require.EqualValues(t, 0, ss.authHits.Load())
+
+	// The largest field allowed is decrypted and put to the Authenticator,
+	// which is the one to say the password is wrong.
+	most := rs.secret(t, strings.Repeat("x", 1000))
+	require.Len(t, most, 5*rsaBlock)
+	requireStatus(t, rs.activate(t, ctx, testUser, most), ua.StatusBadUserAccessDenied)
+	require.EqualValues(t, 5*rsaBlock, decrypted.Load())
+	require.EqualValues(t, 1, ss.authHits.Load())
+}
+
+func TestOverlongUserNameIsRefusedBeforeDecrypt(t *testing.T) {
+	decrypted := server.CountSecretCiphertext(t)
+	ss := startSecureServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	rs := createRawSession(t, ctx, ss)
+
+	secret := rs.secret(t, testPassword)
+	requireStatus(t, rs.activate(t, ctx, strings.Repeat("u", 257), secret), ua.StatusBadIdentityTokenInvalid)
+	require.Zero(t, decrypted.Load())
+	require.EqualValues(t, 0, ss.authHits.Load())
+
+	// A name at the limit is the Authenticator's to refuse.
+	requireStatus(t, rs.activate(t, ctx, strings.Repeat("u", 256), secret), ua.StatusBadUserAccessDenied)
+	require.EqualValues(t, 1, ss.authHits.Load())
+}
