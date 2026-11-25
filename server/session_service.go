@@ -48,7 +48,7 @@ func (s *SessionService) CreateSession(sc *uasc.SecureChannel, r ua.Request, req
 	// that opened the channel, or the session signature exchange proves
 	// nothing about the channel's peer (Part 4, 5.6.2.2).
 	if peer := sc.PeerSecurity(); peer.Mode != ua.MessageSecurityModeNone && !sameLeafCertificate(req.ClientCertificate, peer.Certificate) {
-		s.warn("CreateSession from %s: client certificate does not match the secure channel certificate", remoteAddr(sc))
+		s.warnRefusal(sc, "CreateSession from %s: client certificate does not match the secure channel certificate", remoteAddr(sc))
 		return nil, ua.StatusBadSecurityChecksFailed
 	}
 
@@ -125,8 +125,11 @@ func (s *SessionService) ActivateSession(sc *uasc.SecureChannel, r ua.Request, r
 		return nil, err
 	}
 
-	sess := s.srv.sb.Session(req.RequestHeader.AuthenticationToken)
+	// A peer can send any token, any number of times: the miss is reported
+	// once per host and interval, and the token itself is not logged.
+	sess := s.srv.sb.lookup(req.RequestHeader.AuthenticationToken)
 	if sess == nil {
+		s.warnRefusal(sc, "ActivateSession from %s refused: unknown session token", remoteAddr(sc))
 		return nil, ua.StatusBadSessionIDInvalid
 	}
 
@@ -138,7 +141,7 @@ func (s *SessionService) ActivateSession(sc *uasc.SecureChannel, r ua.Request, r
 		}
 	} else if transfer {
 		if code := sess.checkTransferChannel(peer); code != ua.StatusOK {
-			s.warn("ActivateSession from %s refused: session cannot move to this channel: %s", remoteAddr(sc), code)
+			s.warnRefusal(sc, "ActivateSession from %s refused: session cannot move to this channel: %s", remoteAddr(sc), code)
 			return nil, code
 		}
 	}
@@ -148,20 +151,24 @@ func (s *SessionService) ActivateSession(sc *uasc.SecureChannel, r ua.Request, r
 	}
 	err = sc.VerifySessionSignature(sess.remoteCertificate, sess.serverNonce, req.ClientSignature.Signature)
 	if err != nil {
-		if s.srv.cfg.logger != nil {
-			s.srv.cfg.logger.Warn("error verifying session signature with nonce: %s", err)
-		}
+		s.warnRefusal(sc, "error verifying session signature with nonce: %s", err)
 		return nil, ua.StatusBadSecurityChecksFailed
 	}
 
 	identity, code := s.authenticateIdentity(sc, sess, req)
 	if code != ua.StatusOK {
-		s.warn("ActivateSession from %s rejected: %s", remoteAddr(sc), code)
+		// The application logs its own refusals and may bound them, as for a
+		// lockout; a warning here per attempt would undo that.
+		if !identity.byAuthenticator {
+			s.warnRefusal(sc, "ActivateSession from %s rejected: %s", remoteAddr(sc), code)
+		} else if s.srv.cfg.logger != nil {
+			s.srv.cfg.logger.Debug("ActivateSession from %s rejected by the authenticator: %s", remoteAddr(sc), code)
+		}
 		return nil, code
 	}
 	if transfer {
 		if code := sess.checkTransferIdentity(identity.key); code != ua.StatusOK {
-			s.warn("ActivateSession from %s refused: session cannot move to a different identity: %s", remoteAddr(sc), code)
+			s.warnRefusal(sc, "ActivateSession from %s refused: session cannot move to a different identity: %s", remoteAddr(sc), code)
 			return nil, code
 		}
 	}

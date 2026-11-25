@@ -71,6 +71,9 @@ type channelBroker struct {
 	responseWriteTimeout time.Duration
 	// certValidator vets a client application certificate on OpenSecureChannel.
 	certValidator func(cert []byte) error
+	// enabledSecurity is the security profiles of the server's endpoints, the
+	// only ones besides None a channel may be opened with.
+	enabledSecurity []uasc.SecurityProfile
 
 	// dispatchTimeout is how long a reader waits to hand off a message while
 	// the dispatcher accepts nothing at all; non-positive disables it.
@@ -150,6 +153,7 @@ func (c *channelBroker) RegisterConn(ctx context.Context, conn *uacp.Conn, local
 	cfg.Logger = c.logger
 	cfg.ResponseWriteTimeout = c.responseWriteTimeout
 	cfg.RemoteCertificateValidator = c.certValidator
+	cfg.EnabledSecurity = c.enabledSecurity
 
 	c.mu.Lock()
 	c.secureChannelID++

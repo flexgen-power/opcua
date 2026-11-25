@@ -6,6 +6,7 @@ package uasc
 
 import (
 	"bytes"
+	"slices"
 
 	"github.com/gopcua/opcua/ua"
 	"github.com/gopcua/opcua/uapolicy"
@@ -28,6 +29,12 @@ type PeerSecurity struct {
 	Certificate []byte
 }
 
+// SecurityProfile is a security policy together with a message security mode.
+type SecurityProfile struct {
+	PolicyURI string
+	Mode      ua.MessageSecurityMode
+}
+
 // PeerSecurity returns the channel's security profile. It is published whole,
 // so the three fields always belong together, and it is safe to call from any
 // goroutine. Before the channel has opened it reports the None profile.
@@ -44,6 +51,36 @@ func (s *SecureChannel) established() bool {
 	s.instancesMu.Lock()
 	defer s.instancesMu.Unlock()
 	return s.activeInstance != nil
+}
+
+// checkOpenPolicy refuses an OpenSecureChannel that would open a server channel
+// under a security policy the server has not enabled. The policy is in the
+// clear in the message header, so this runs before the peer's certificate is
+// looked at and before the private key is used: the key only ever works under
+// a policy the server offers. Policy None is let through for discovery.
+func (s *SecureChannel) checkOpenPolicy(policyURI string) error {
+	if policyURI == ua.SecurityPolicyURINone {
+		return nil
+	}
+	for _, p := range s.cfg.EnabledSecurity {
+		if p.PolicyURI == policyURI {
+			return nil
+		}
+	}
+	return ua.StatusBadSecurityPolicyRejected
+}
+
+// checkOpenMode refuses an OpenSecureChannel that would open a server channel
+// in a security mode the server has not enabled for the channel's policy.
+func (s *SecureChannel) checkOpenMode(mode ua.MessageSecurityMode) error {
+	policyURI := s.cfg.SecurityPolicyURI
+	if policyURI == ua.SecurityPolicyURINone && mode == ua.MessageSecurityModeNone {
+		return nil
+	}
+	if slices.Contains(s.cfg.EnabledSecurity, SecurityProfile{PolicyURI: policyURI, Mode: mode}) {
+		return nil
+	}
+	return ua.StatusBadSecurityModeRejected
 }
 
 // checkRenewalPolicy refuses an OpenSecureChannel on an established channel

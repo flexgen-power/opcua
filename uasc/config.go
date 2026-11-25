@@ -55,6 +55,13 @@ type Config struct {
 	// used. A non-nil error refuses the channel. Only the server side sets it.
 	RemoteCertificateValidator func(cert []byte) error
 
+	// EnabledSecurity lists the security profiles a server channel may be
+	// opened with. An inbound OpenSecureChannel that asks for any other is
+	// refused, except that policy None with mode None is always accepted,
+	// because clients read the endpoint list over such a channel. Only the
+	// server side reads it.
+	EnabledSecurity []SecurityProfile
+
 	// RequestIDSeed is the initial value for RequestID counter in each new SecureChannel
 	RequestIDSeed uint32
 

@@ -11,6 +11,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"time"
 
 	"github.com/gopcua/opcua/ua"
 	"github.com/gopcua/opcua/uapolicy"
@@ -70,7 +71,8 @@ func ClientCertificateValidator(v func(cert []byte) error) Option {
 	}
 }
 
-// identityResult carries what ActivateSession needs to know about an accepted token.
+// identityResult carries what ActivateSession needs to know about an accepted
+// token, or who refused it.
 type identityResult struct {
 	tokenType ua.UserTokenType
 	policyID  string
@@ -79,6 +81,9 @@ type identityResult struct {
 	// checked to be the same identity: "anonymous", "user:<name>" or
 	// "cert:<thumbprint>".
 	key string
+	// byAuthenticator marks a refusal as the Authenticator's decision rather
+	// than a fault this package found in the token.
+	byAuthenticator bool
 }
 
 // authenticateIdentity resolves the identity token of an ActivateSession
@@ -125,7 +130,9 @@ func (s *SessionService) authenticateIdentity(sc *uasc.SecureChannel, sess *sess
 	}
 
 	if s.srv.cfg.authenticator == nil {
-		s.warn("rejecting %s identity token from %s: no authenticator configured", tokenType, remoteAddr(sc))
+		// ActivateSession reports the refusal, bounded per host; a warning
+		// here as well would be one per attempt.
+		s.debug("rejecting %s identity token from %s: no authenticator configured", tokenType, remoteAddr(sc))
 		return identityResult{}, ua.StatusBadIdentityTokenRejected
 	}
 
@@ -173,9 +180,9 @@ func (s *SessionService) authenticateIdentity(sc *uasc.SecureChannel, sess *sess
 		// else, including StatusOK returned as an error, still refuses.
 		var code ua.StatusCode
 		if errors.As(err, &code) && code&ua.StatusBad != 0 {
-			return identityResult{}, code
+			return identityResult{byAuthenticator: true}, code
 		}
-		return identityResult{}, ua.StatusBadUserAccessDenied
+		return identityResult{byAuthenticator: true}, ua.StatusBadUserAccessDenied
 	}
 	return res, ua.StatusOK
 }
@@ -204,11 +211,26 @@ func (s *SessionService) matchTokenPolicy(peer uasc.PeerSecurity, tokenType ua.U
 	return nil, false
 }
 
+// A UserName token arrives before the client has proved who it is, so what it
+// can make the server process is bounded: the name, and the plaintext an
+// encrypted password field may hold (the length prefix, the password and the
+// server nonce).
+const (
+	maxUserNameLength   = 256
+	maxUserSecretLength = 1024
+)
+
+// decryptSecret is a variable so a test can count the private-key work a token costs.
+var decryptSecret = (*uapolicy.EncryptionAlgorithm).Decrypt
+
 // decryptUserPassword recovers the plaintext password of a UserName token.
 // The secret is the legacy encrypted-secret layout of Part 4, 7.41.2.2:
 // a little-endian uint32 length, the password, then the server nonce the
 // client was last given.
 func (s *SessionService) decryptUserPassword(peer uasc.PeerSecurity, sess *session, policyURI string, tok *ua.UserNameIdentityToken) ([]byte, ua.StatusCode) {
+	if len(tok.UserName) > maxUserNameLength {
+		return nil, ua.StatusBadIdentityTokenInvalid
+	}
 	if policyURI == ua.SecurityPolicyURINone {
 		// A cleartext password is only acceptable inside an encrypted channel.
 		if peer.Mode != ua.MessageSecurityModeSignAndEncrypt {
@@ -221,10 +243,11 @@ func (s *SessionService) decryptUserPassword(peer uasc.PeerSecurity, sess *sessi
 	}
 
 	if s.srv.cfg.privateKey == nil {
-		s.warn("rejecting UserName token: server has no private key to decrypt it")
+		s.debug("rejecting UserName token: server has no private key to decrypt it")
 		return nil, ua.StatusBadIdentityTokenRejected
 	}
-	enc, err := uapolicy.Asymmetric(policyURI, s.srv.cfg.privateKey, nil)
+	// The public half is passed only so the block sizes below are those of our key.
+	enc, err := uapolicy.Asymmetric(policyURI, s.srv.cfg.privateKey, &s.srv.cfg.privateKey.PublicKey)
 	if err != nil {
 		return nil, ua.StatusBadIdentityTokenInvalid
 	}
@@ -232,7 +255,14 @@ func (s *SessionService) decryptUserPassword(peer uasc.PeerSecurity, sess *sessi
 		return nil, ua.StatusBadIdentityTokenInvalid
 	}
 
-	plain, err := enc.Decrypt(tok.Password)
+	// Each block costs a private-key operation on the request dispatcher, so a
+	// field with more blocks than the largest secret needs is refused unopened.
+	per := enc.PlaintextBlockSize()
+	if per < 1 || len(tok.Password) > (maxUserSecretLength+per-1)/per*enc.BlockSize() {
+		return nil, ua.StatusBadIdentityTokenInvalid
+	}
+
+	plain, err := decryptSecret(enc, tok.Password)
 	if err != nil {
 		return nil, ua.StatusBadIdentityTokenInvalid
 	}
@@ -295,8 +325,27 @@ func sameLeafCertificate(a, b []byte) bool {
 	return bytes.Equal(ca.Raw, cb.Raw)
 }
 
-func (s *SessionService) warn(msg string, args ...any) {
+func (s *SessionService) debug(msg string, args ...any) {
 	if s.srv.cfg.logger != nil {
-		s.srv.cfg.logger.Warn(msg, args...)
+		s.srv.cfg.logger.Debug(msg, args...)
 	}
+}
+
+// warnRefusal is warn for a refusal the peer can provoke again at once: the
+// first from a host in an interval is a warning, the rest are debug lines.
+func (s *SessionService) warnRefusal(sc *uasc.SecureChannel, msg string, args ...any) {
+	logger := s.srv.cfg.logger
+	if logger == nil {
+		return
+	}
+	ok, skipped := s.srv.refusals.allow(remoteAddr(sc), time.Now())
+	if !ok {
+		logger.Debug(msg, args...)
+		return
+	}
+	if skipped > 0 {
+		msg += " (%d refusals from this host since the last warning were logged at debug)"
+		args = append(args[:len(args):len(args)], skipped)
+	}
+	logger.Warn(msg, args...)
 }

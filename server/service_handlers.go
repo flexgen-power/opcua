@@ -6,6 +6,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	rdebug "runtime/debug"
 	"time"
@@ -150,7 +151,13 @@ func (s *Server) handleService(ctx context.Context, sc *uasc.SecureChannel, reqI
 	if err != nil {
 		endPayload.Event = "service_dispatch_error"
 		endPayload.ErrorText = err.Error()
-		emitDiagWarn(s.cfg.logger, endPayload)
+		// Refusals the session service logs, bounded per host, where it makes
+		// them; a warning here for each attempt would undo that.
+		if reportedRefusal(req, err) {
+			emitDiagInfo(s.cfg.logger, endPayload)
+		} else {
+			emitDiagWarn(s.cfg.logger, endPayload)
+		}
 	} else {
 		emitDiagInfo(s.cfg.logger, endPayload)
 	}
@@ -185,6 +192,20 @@ func (s *Server) handleService(ctx context.Context, sc *uasc.SecureChannel, reqI
 			s.cfg.logger.Warn("Error sending response: %s\n", err)
 		}
 	}
+}
+
+// reportedRefusal says whether the handler has already logged err through
+// warnRefusal: any ActivateSession refusal, and a CreateSession whose client
+// certificate is not the channel's. Other CreateSession errors, such as a
+// failure to make a nonce, are the server's own and still warn here.
+func reportedRefusal(req ua.Request, err error) bool {
+	switch req.(type) {
+	case *ua.ActivateSessionRequest:
+		return true
+	case *ua.CreateSessionRequest:
+		return errors.Is(err, ua.StatusBadSecurityChecksFailed)
+	}
+	return false
 }
 
 // sessionlessServices may be called without an activated session: discovery,

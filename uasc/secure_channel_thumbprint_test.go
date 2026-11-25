@@ -70,6 +70,7 @@ func TestServerReadChunkDerivesReceiverThumbprint_Part6_672(t *testing.T) {
 		SecurityMode:      ua.MessageSecurityModeSignAndEncrypt,
 		LocalKey:          srvKey,
 		Certificate:       srvCertDER,
+		EnabledSecurity:   []SecurityProfile{{ua.SecurityPolicyURIBasic256Sha256, ua.MessageSecurityModeSignAndEncrypt}},
 	}
 	s, err := NewServerSecureChannel("opc.tcp://localhost", srvConn, cfg, make(chan error, 1), 1, 1, 1)
 	require.NoError(t, err)

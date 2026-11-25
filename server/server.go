@@ -21,6 +21,7 @@ import (
 	"github.com/gopcua/opcua/ua"
 	"github.com/gopcua/opcua/uacp"
 	"github.com/gopcua/opcua/uapolicy"
+	"github.com/gopcua/opcua/uasc"
 )
 
 //go:generate go run ../cmd/predefined-nodes/main.go
@@ -41,6 +42,8 @@ type Server struct {
 	l  *uacp.Listener
 	cb *channelBroker
 	sb *sessionBroker
+
+	refusals refusalLog
 
 	// nextSecureChannelID uint32
 
@@ -281,6 +284,8 @@ func (s *Server) Start(ctx context.Context) error {
 		s.cb = newChannelBroker(s.cfg.logger, s.cfg.responseWriteTimeout, s.cfg.requestDispatchTimeout)
 		s.cb.certValidator = s.cfg.clientCertValidator
 	}
+	// Set before the first connection is accepted; the channels only read it.
+	s.cb.enabledSecurity = enabledSecurity(s.Endpoints())
 
 	go s.acceptAndRegister(ctx, s.l)
 	go s.monitorConnections(ctx)
@@ -473,6 +478,18 @@ func (s *Server) initEndpoints() {
 	s.mu.Lock()
 	s.endpoints = endpoints
 	s.mu.Unlock()
+}
+
+// enabledSecurity returns the security profiles of the given endpoints.
+func enabledSecurity(endpoints []*ua.EndpointDescription) []uasc.SecurityProfile {
+	var profiles []uasc.SecurityProfile
+	for _, ep := range endpoints {
+		p := uasc.SecurityProfile{PolicyURI: ep.SecurityPolicyURI, Mode: ep.SecurityMode}
+		if !slices.Contains(profiles, p) {
+			profiles = append(profiles, p)
+		}
+	}
+	return profiles
 }
 
 func (s *Server) Node(nid *ua.NodeID) *Node {
