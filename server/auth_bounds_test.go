@@ -280,6 +280,29 @@ func TestOtherActivateSessionRefusalsWarnOncePerHost(t *testing.T) {
 		require.Equal(t, before+1, countWarn(log), "one warning for the host, however many attempts")
 	})
 
+	t.Run("CreateSession certificate mismatch", func(t *testing.T) {
+		log := &captureLogger{}
+		ss := startSecureServer(t, server.SetLogger(log))
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		sc, _ := openRawChannel(t, ctx, ss)
+		// A certificate other than the one that opened the channel.
+		otherCert, _ := genCert(t, "urn:gopcua:test:not-the-channel-client")
+		before := countWarn(log)
+		for i := 0; i < attempts; i++ {
+			_, err := sendFor(ctx, sc, &ua.CreateSessionRequest{
+				ClientDescription:       &ua.ApplicationDescription{ApplicationType: ua.ApplicationTypeClient, ApplicationName: &ua.LocalizedText{}},
+				EndpointURL:             ss.addr,
+				SessionName:             "mismatch",
+				ClientNonce:             make([]byte, 32),
+				ClientCertificate:       otherCert,
+				RequestedSessionTimeout: 60000,
+			}, nil, 30*time.Second)
+			requireStatus(t, err, ua.StatusBadSecurityChecksFailed)
+		}
+		require.Equal(t, before+1, countWarn(log), "one warning for the host, however many attempts")
+	})
+
 	t.Run("session cannot move to this channel", func(t *testing.T) {
 		log := &captureLogger{}
 		ss := startSecureServer(t, server.SetLogger(log))
