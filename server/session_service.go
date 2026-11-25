@@ -148,9 +148,7 @@ func (s *SessionService) ActivateSession(sc *uasc.SecureChannel, r ua.Request, r
 	}
 	err = sc.VerifySessionSignature(sess.remoteCertificate, sess.serverNonce, req.ClientSignature.Signature)
 	if err != nil {
-		if s.srv.cfg.logger != nil {
-			s.srv.cfg.logger.Warn("error verifying session signature with nonce: %s", err)
-		}
+		s.warnRefusal(sc, "error verifying session signature with nonce: %s", err)
 		return nil, ua.StatusBadSecurityChecksFailed
 	}
 
@@ -159,7 +157,7 @@ func (s *SessionService) ActivateSession(sc *uasc.SecureChannel, r ua.Request, r
 		// The application logs its own refusals and may bound them, as for a
 		// lockout; a warning here per attempt would undo that.
 		if !identity.byAuthenticator {
-			s.warn("ActivateSession from %s rejected: %s", remoteAddr(sc), code)
+			s.warnRefusal(sc, "ActivateSession from %s rejected: %s", remoteAddr(sc), code)
 		} else if s.srv.cfg.logger != nil {
 			s.srv.cfg.logger.Debug("ActivateSession from %s rejected by the authenticator: %s", remoteAddr(sc), code)
 		}

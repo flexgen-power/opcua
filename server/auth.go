@@ -11,6 +11,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"time"
 
 	"github.com/gopcua/opcua/ua"
 	"github.com/gopcua/opcua/uapolicy"
@@ -326,4 +327,23 @@ func (s *SessionService) warn(msg string, args ...any) {
 	if s.srv.cfg.logger != nil {
 		s.srv.cfg.logger.Warn(msg, args...)
 	}
+}
+
+// warnRefusal is warn for a refusal the peer can provoke again at once: the
+// first from a host in an interval is a warning, the rest are debug lines.
+func (s *SessionService) warnRefusal(sc *uasc.SecureChannel, msg string, args ...any) {
+	logger := s.srv.cfg.logger
+	if logger == nil {
+		return
+	}
+	ok, skipped := s.srv.refusals.allow(remoteAddr(sc), time.Now())
+	if !ok {
+		logger.Debug(msg, args...)
+		return
+	}
+	if skipped > 0 {
+		msg += " (%d refusals from this host since the last warning were logged at debug)"
+		args = append(args[:len(args):len(args)], skipped)
+	}
+	logger.Warn(msg, args...)
 }

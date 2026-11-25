@@ -150,7 +150,13 @@ func (s *Server) handleService(ctx context.Context, sc *uasc.SecureChannel, reqI
 	if err != nil {
 		endPayload.Event = "service_dispatch_error"
 		endPayload.ErrorText = err.Error()
-		emitDiagWarn(s.cfg.logger, endPayload)
+		// A refused ActivateSession is logged, and bounded, where it is
+		// refused; a warning here for each attempt would undo that.
+		if _, login := req.(*ua.ActivateSessionRequest); login {
+			emitDiagInfo(s.cfg.logger, endPayload)
+		} else {
+			emitDiagWarn(s.cfg.logger, endPayload)
+		}
 	} else {
 		emitDiagInfo(s.cfg.logger, endPayload)
 	}

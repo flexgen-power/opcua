@@ -170,37 +170,62 @@ func TestOverlongUserNameIsRefusedBeforeDecrypt(t *testing.T) {
 // The application's Authenticator owns login logging: it may log a lockout
 // once and then stay quiet. The server must not add a warning of its own for
 // each refusal the Authenticator returns, or that bound is lost. Refusals the
-// server detects itself still warn.
-func TestAuthenticatorRefusalsAreNotWarned(t *testing.T) {
+// server detects itself cost the peer nothing to repeat, so they warn once per
+// remote host and interval, not once per attempt.
+func TestRefusedLoginsDoNotWarnPerAttempt(t *testing.T) {
 	log := &captureLogger{}
 	ss := startSecureServer(t, server.SetLogger(log))
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	rs := createRawSession(t, ctx, ss)
 
-	// The per-request diagnostic line is not about logins and is not counted.
-	rejections := func(level string) int {
+	// Every line at the level counts, the per-request diagnostic line included.
+	count := func(level, sub string) int {
 		log.mu.Lock()
 		defer log.mu.Unlock()
 		n := 0
 		for _, line := range log.lines {
-			if strings.HasPrefix(line, level+" ") && !strings.Contains(line, "gopcua_diag") && strings.Contains(line, "ActivateSession from") {
+			if strings.HasPrefix(line, level+" ") && strings.Contains(line, sub) {
 				n++
 			}
 		}
 		return n
 	}
+	before := count("WARN", "")
 
 	const refusals = 5
 	for i := 0; i < refusals; i++ {
 		requireStatus(t, rs.activate(t, ctx, testUser, rs.secret(t, "wrong")), ua.StatusBadUserAccessDenied)
 	}
 	require.EqualValues(t, refusals, ss.authHits.Load())
-	require.Zero(t, rejections("WARN"), "the server warned about refusals the authenticator decided")
-	require.Equal(t, refusals, rejections("DEBUG"))
+	require.Equal(t, before, count("WARN", ""), "the server warned about refusals the authenticator decided")
+	require.Equal(t, refusals, count("DEBUG", "rejected by the authenticator"))
 
+	otherNonce, _, err := rs.sc.EncryptUserPassword("", testPassword, rs.serverCert, make([]byte, 32))
+	require.NoError(t, err)
+	sixBlocks := rs.secret(t, strings.Repeat("x", 1100))
+	good := rs.secret(t, testPassword)
+	for i := 0; i < refusals; i++ {
+		requireStatus(t, rs.activate(t, ctx, strings.Repeat("u", 257), good), ua.StatusBadIdentityTokenInvalid)
+		requireStatus(t, rs.activate(t, ctx, testUser, sixBlocks), ua.StatusBadIdentityTokenInvalid)
+		requireStatus(t, rs.activate(t, ctx, testUser, otherNonce), ua.StatusBadIdentityTokenInvalid)
+		_, err := sendFor(ctx, rs.sc, &ua.ActivateSessionRequest{
+			ClientSignature:    &ua.SignatureData{Signature: make([]byte, rsaBlock)},
+			UserIdentityToken:  ua.NewExtensionObject(&ua.AnonymousIdentityToken{}),
+			UserTokenSignature: &ua.SignatureData{},
+		}, rs.token, 30*time.Second)
+		requireStatus(t, err, ua.StatusBadSecurityChecksFailed)
+	}
+	policyID := rs.policyID
 	rs.policyID = "no-such-policy"
-	requireStatus(t, rs.activate(t, ctx, testUser, rs.secret(t, "wrong")), ua.StatusBadIdentityTokenInvalid)
+	for i := 0; i < refusals; i++ {
+		requireStatus(t, rs.activate(t, ctx, testUser, good), ua.StatusBadIdentityTokenInvalid)
+	}
 	require.EqualValues(t, refusals, ss.authHits.Load(), "the authenticator saw a token the server should have refused")
-	require.Equal(t, 1, rejections("WARN"))
+	require.Equal(t, before+1, count("WARN", ""), "one warning for the host, however many attempts")
+	require.Equal(t, 1, count("WARN", "ActivateSession from"))
+
+	// None of that stands in the way of a real login.
+	rs.policyID = policyID
+	require.NoError(t, rs.activate(t, ctx, testUser, good))
 }

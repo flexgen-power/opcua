@@ -43,6 +43,8 @@ type Server struct {
 	cb *channelBroker
 	sb *sessionBroker
 
+	refusals refusalLog
+
 	// nextSecureChannelID uint32
 
 	// Service Handlers are methods called to respond to service requests from clients
