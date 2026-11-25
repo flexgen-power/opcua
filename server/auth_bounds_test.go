@@ -229,3 +229,75 @@ func TestRefusedLoginsDoNotWarnPerAttempt(t *testing.T) {
 	rs.policyID = policyID
 	require.NoError(t, rs.activate(t, ctx, testUser, good))
 }
+
+// Refusals a peer can repeat at once, other than a wrong password, are each
+// worth one warning per host per interval, not one per attempt: an unknown
+// session token, a UserName token the server has no authenticator for, and a
+// session that may not move to the asking channel.
+func TestOtherActivateSessionRefusalsWarnOncePerHost(t *testing.T) {
+	const attempts = 5
+	countWarn := func(log *captureLogger) int {
+		log.mu.Lock()
+		defer log.mu.Unlock()
+		n := 0
+		for _, line := range log.lines {
+			if strings.HasPrefix(line, "WARN ") {
+				n++
+			}
+		}
+		return n
+	}
+
+	t.Run("unknown session token", func(t *testing.T) {
+		log := &captureLogger{}
+		ss := startSecureServer(t, server.SetLogger(log))
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		sc, _ := openRawChannel(t, ctx, ss)
+		before := countWarn(log)
+		for i := 0; i < attempts; i++ {
+			_, err := sendFor(ctx, sc, &ua.ActivateSessionRequest{
+				ClientSignature:    &ua.SignatureData{},
+				UserIdentityToken:  ua.NewExtensionObject(&ua.AnonymousIdentityToken{}),
+				UserTokenSignature: &ua.SignatureData{},
+			}, ua.NewStringNodeID(0, "no-such-session\nWARN forged line"), 30*time.Second)
+			requireStatus(t, err, ua.StatusBadSessionIDInvalid)
+		}
+		require.Equal(t, before+1, countWarn(log), "one warning for the host, however many attempts")
+		require.False(t, log.contains("forged line"), "the client's token was written to the log")
+	})
+
+	t.Run("no authenticator", func(t *testing.T) {
+		log := &captureLogger{}
+		ss := startSecureServer(t, server.SetLogger(log), server.SetAuthenticator(nil))
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		rs := createRawSession(t, ctx, ss)
+		before := countWarn(log)
+		for i := 0; i < attempts; i++ {
+			requireStatus(t, rs.activate(t, ctx, testUser, rs.secret(t, testPassword)), ua.StatusBadIdentityTokenRejected)
+		}
+		require.Equal(t, before+1, countWarn(log), "one warning for the host, however many attempts")
+	})
+
+	t.Run("session cannot move to this channel", func(t *testing.T) {
+		log := &captureLogger{}
+		ss := startSecureServer(t, server.SetLogger(log))
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		rs := createRawSession(t, ctx, ss)
+		require.NoError(t, rs.activate(t, ctx, testUser, rs.secret(t, testPassword)))
+		// Another client application, with its own certificate, holding the token.
+		other, _ := openRawChannel(t, ctx, ss)
+		before := countWarn(log)
+		for i := 0; i < attempts; i++ {
+			_, err := sendFor(ctx, other, &ua.ActivateSessionRequest{
+				ClientSignature:    &ua.SignatureData{},
+				UserIdentityToken:  ua.NewExtensionObject(&ua.AnonymousIdentityToken{}),
+				UserTokenSignature: &ua.SignatureData{},
+			}, rs.token, 30*time.Second)
+			requireStatus(t, err, ua.StatusBadSecurityChecksFailed)
+		}
+		require.Equal(t, before+1, countWarn(log), "one warning for the host, however many attempts")
+	})
+}

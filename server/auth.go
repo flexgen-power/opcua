@@ -130,7 +130,9 @@ func (s *SessionService) authenticateIdentity(sc *uasc.SecureChannel, sess *sess
 	}
 
 	if s.srv.cfg.authenticator == nil {
-		s.warn("rejecting %s identity token from %s: no authenticator configured", tokenType, remoteAddr(sc))
+		// ActivateSession reports the refusal, bounded per host; a warning
+		// here as well would be one per attempt.
+		s.debug("rejecting %s identity token from %s: no authenticator configured", tokenType, remoteAddr(sc))
 		return identityResult{}, ua.StatusBadIdentityTokenRejected
 	}
 
@@ -241,7 +243,7 @@ func (s *SessionService) decryptUserPassword(peer uasc.PeerSecurity, sess *sessi
 	}
 
 	if s.srv.cfg.privateKey == nil {
-		s.warn("rejecting UserName token: server has no private key to decrypt it")
+		s.debug("rejecting UserName token: server has no private key to decrypt it")
 		return nil, ua.StatusBadIdentityTokenRejected
 	}
 	// The public half is passed only so the block sizes below are those of our key.
@@ -323,9 +325,9 @@ func sameLeafCertificate(a, b []byte) bool {
 	return bytes.Equal(ca.Raw, cb.Raw)
 }
 
-func (s *SessionService) warn(msg string, args ...any) {
+func (s *SessionService) debug(msg string, args ...any) {
 	if s.srv.cfg.logger != nil {
-		s.srv.cfg.logger.Warn(msg, args...)
+		s.srv.cfg.logger.Debug(msg, args...)
 	}
 }
 

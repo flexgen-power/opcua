@@ -93,11 +93,16 @@ func (sb *sessionBroker) Close(authToken *ua.NodeID) error {
 	return nil
 }
 
-func (sb *sessionBroker) Session(authToken *ua.NodeID) *session {
+// lookup finds a session without logging a miss, for a caller that reports
+// the refusal itself.
+func (sb *sessionBroker) lookup(authToken *ua.NodeID) *session {
 	sb.mu.Lock()
 	defer sb.mu.Unlock()
+	return sb.s[authToken.String()]
+}
 
-	s := sb.s[authToken.String()]
+func (sb *sessionBroker) Session(authToken *ua.NodeID) *session {
+	s := sb.lookup(authToken)
 	if s == nil {
 		if sb.logger != nil {
 			sb.logger.Warn("sessionBroker.Session: error looking up session %v", authToken)
