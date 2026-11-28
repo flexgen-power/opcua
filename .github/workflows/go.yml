@@ -3,16 +3,30 @@ on:
   push:
     branches:
       - main
+      - opcua_interface-changes
   pull_request:
+
+# Read-only: the jobs build and test, and publish nothing.
+permissions:
+  contents: read
+
+# A newer push to the same pull request replaces the run in progress.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
-    name: Test ${{ matrix.os }} go${{ matrix.go }}
-    runs-on: ${{ matrix.os }}
+    name: Test go${{ matrix.go }}
+    runs-on: ubuntu-latest
+    # The server package's tests take a few minutes under the race detector.
+    # The limit is there to end a hang, not to bound a normal run.
+    timeout-minutes: 30
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
-        go: ["1.23.x", "1.24.x"]
+        # The oldest release go.mod allows, and a current one.
+        go: ["1.23.x", "1.25.x"]
 
     steps:
       - name: Check out code into the Go module directory
@@ -25,7 +39,7 @@ jobs:
         id: go
 
       - name: Setup Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11.X"
           architecture: "x64"
@@ -35,5 +49,11 @@ jobs:
           go mod download
           make install-py-opcua
 
-      - name: Run Tests
-        run: make test integration
+      - name: Unit tests
+        run: make test
+
+      - name: Integration tests against python-opcua
+        run: make integration
+
+      - name: Integration tests, client against server
+        run: make selfintegration
