@@ -17,6 +17,11 @@ integration:
 selfintegration:
 	go test -count=1 -race -v -tags=integration ./tests/go...
 
+# An independent client implementation (asyncua) against a server built from
+# this checkout. Needs python3 with venv; see tests/interop/asyncua/README.md.
+interop:
+	tests/interop/asyncua/run.sh
+
 examples:
 	go build -o build/ ./examples/...
 
@@ -36,4 +41,4 @@ gen:
 release:
 	GITHUB_TOKEN=$$(security find-generic-password -gs GITHUB_TOKEN -w) goreleaser --clean
 
-.PHONY: all examples gen integration test release
+.PHONY: all examples gen integration interop test release

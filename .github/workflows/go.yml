@@ -57,3 +57,26 @@ jobs:
 
       - name: Integration tests, client against server
         run: make selfintegration
+
+  # An independent client implementation against the server, so that the two
+  # sides of the protocol are not checked only against each other.
+  interop:
+    name: Interop (asyncua client)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11.X"
+
+      - name: Run the asyncua interop check
+        run: make interop
