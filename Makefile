@@ -22,6 +22,13 @@ selfintegration:
 interop:
 	tests/interop/asyncua/run.sh
 
+# Search for inputs the decoders mishandle. The seeds run as part of `make
+# test`; this looks further. FUZZTIME is per target.
+FUZZTIME ?= 30s
+fuzz:
+	go test -run '^$$' -fuzz FuzzDecode -fuzztime $(FUZZTIME) ./uacp
+	go test -run '^$$' -fuzz FuzzDecodeHeaders -fuzztime $(FUZZTIME) ./uasc
+
 examples:
 	go build -o build/ ./examples/...
 
@@ -41,4 +48,4 @@ gen:
 release:
 	GITHUB_TOKEN=$$(security find-generic-password -gs GITHUB_TOKEN -w) goreleaser --clean
 
-.PHONY: all examples gen integration interop test release
+.PHONY: all examples fuzz gen integration interop test release
